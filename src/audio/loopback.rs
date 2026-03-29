@@ -89,7 +89,7 @@ pub fn loopback_loop(
 }
 
 /// Convert raw WASAPI buffer to mono f32.
-unsafe fn convert_to_f32_mono(buffer: *const u8, frames: usize, channels: usize, bits: u16) -> Vec<f32> {
+unsafe fn convert_to_f32_mono(buffer: *const u8, frames: usize, channels: usize, bits: u16) -> Vec<f32> { unsafe {
     let mut mono = Vec::with_capacity(frames);
     match bits {
         32 => {
@@ -111,7 +111,7 @@ unsafe fn convert_to_f32_mono(buffer: *const u8, frames: usize, channels: usize,
         }
     }
     mono
-}
+}}
 
 /// Naive linear resampling.
 fn simple_resample(input: &[f32], from_rate: usize, to_rate: usize) -> Vec<f32> {

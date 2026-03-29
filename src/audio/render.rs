@@ -119,7 +119,7 @@ unsafe fn write_to_device_buffer(
     mono: &[f32],
     channels: usize,
     bits: u16,
-) {
+) { unsafe {
     match bits {
         32 => {
             let data =
@@ -142,7 +142,7 @@ unsafe fn write_to_device_buffer(
         }
         _ => {}
     }
-}
+}}
 
 /// Naive linear resampling.
 fn simple_resample(input: &[f32], from_rate: usize, to_rate: usize) -> Vec<f32> {

@@ -134,7 +134,7 @@ pub fn run_tray(state: Arc<Mutex<TrayState>>, cmd_tx: Sender<EngineCommand>) -> 
     Ok(())
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT { unsafe {
     match msg {
         WM_TRAYICON => {
             let event = (lparam.0 & 0xFFFF) as u32;
@@ -163,9 +163,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
+}}
 
-unsafe fn handle_right_click(hwnd: HWND) {
+unsafe fn handle_right_click(hwnd: HWND) { unsafe {
     let ctx = match get_ctx() {
         Some(c) => c,
         None => return,
@@ -186,6 +186,18 @@ unsafe fn handle_right_click(hwnd: HWND) {
 
     // Microphone submenu.
     let mic_menu = CreatePopupMenu().unwrap();
+    if st.capture_devices.is_empty() {
+        let mut label = wide("No devices found");
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_STATE,
+            fState: MFS_DISABLED,
+            dwTypeData: PWSTR(label.as_mut_ptr()),
+            cch: label.len() as u32 - 1,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(mic_menu, 0, true, &mii);
+    }
     for (i, dev) in st.capture_devices.iter().enumerate() {
         let mut label = wide(&dev.name);
         let mii = MENUITEMINFOW {
@@ -219,6 +231,18 @@ unsafe fn handle_right_click(hwnd: HWND) {
 
     // Speaker submenu.
     let speaker_menu = CreatePopupMenu().unwrap();
+    if st.render_devices.is_empty() {
+        let mut label = wide("No devices found");
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_STATE,
+            fState: MFS_DISABLED,
+            dwTypeData: PWSTR(label.as_mut_ptr()),
+            cch: label.len() as u32 - 1,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(speaker_menu, 0, true, &mii);
+    }
     for (i, dev) in st.render_devices.iter().enumerate() {
         let mut label = wide(&dev.name);
         let mii = MENUITEMINFOW {
@@ -314,9 +338,9 @@ unsafe fn handle_right_click(hwnd: HWND) {
     let _ = SetForegroundWindow(hwnd);
     let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
     let _ = DestroyMenu(menu);
-}
+}}
 
-unsafe fn handle_menu_command(id: u32) {
+unsafe fn handle_menu_command(id: u32) { unsafe {
     let ctx = match get_ctx() {
         Some(c) => c,
         None => return,
@@ -350,4 +374,4 @@ unsafe fn handle_menu_command(id: u32) {
         let _ = ctx.cmd_tx.send(EngineCommand::Shutdown);
         PostQuitMessage(0);
     }
-}
+}}
