@@ -17,6 +17,7 @@ use crate::tray::TrayState;
 pub enum EngineCommand {
     SetMicDevice(String),
     SetSpeakerDevice(String),
+    SetOutputDevice(String),
     RefreshDevices,
     Shutdown,
 }
@@ -142,7 +143,7 @@ impl AudioEngine {
     /// Try to find a virtual audio cable output device.
     fn try_find_output(state: &Mutex<TrayState>) -> Option<String> {
         let render = device::list_render_devices().ok()?;
-        let output_id = device::find_device_id_by_name(&render, "cable").ok();
+        let output_id = device::find_device_id_by_name(&render, "cable input").ok();
         let mut st = state.lock().unwrap();
         st.render_devices = render;
         st.current_output_id = output_id.clone();
@@ -263,6 +264,23 @@ impl AudioEngine {
                         frames_processed = 0;
                         if self.verbose {
                             eprintln!("[engine] Switched speaker device, pipeline restarted.");
+                        }
+                    }
+                }
+                Ok(EngineCommand::SetOutputDevice(new_id)) => {
+                    if let Some(ref mut p) = pipeline {
+                        p.shutdown();
+                        pipeline = None;
+                        processor = None;
+                    }
+                    output_id = Some(new_id.clone());
+                    self.state.lock().unwrap().current_output_id = Some(new_id);
+                    if let Some(result) = Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
+                        pipeline = Some(result?);
+                        processor = Some(AecProcessor::new()?);
+                        frames_processed = 0;
+                        if self.verbose {
+                            eprintln!("[engine] Switched output device, pipeline restarted.");
                         }
                     }
                 }

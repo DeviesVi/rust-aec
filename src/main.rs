@@ -160,7 +160,7 @@ fn run(verbose: bool) -> Result<()> {
                 .context("Output virtual cable device not found")?,
         )
     } else {
-        match device::find_device_id_by_name(&render_devices, "cable") {
+        match device::find_device_id_by_name(&render_devices, "cable input") {
             Ok(id) => Some(id),
             Err(_) => {
                 if verbose {

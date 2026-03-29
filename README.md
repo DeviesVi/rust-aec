@@ -16,8 +16,8 @@ Speaker Output ──► [reference] ──┘        │
 
 1. Captures your microphone and speaker output simultaneously.
 2. Runs WebRTC AEC3 echo cancellation to remove the speaker signal from the mic.
-3. Writes the clean audio to a virtual audio cable.
-4. Other apps select the virtual cable's output as their microphone input.
+3. Writes the clean audio to the CABLE Input virtual device.
+4. Other apps select CABLE Output as their microphone input.
 
 ## Requirements
 
@@ -51,7 +51,7 @@ cargo run --release
 cargo run --release -- --verbose
 ```
 
-The program auto-detects the VB-Audio cable, selects a real microphone (skipping virtual cables), and starts processing. A system tray icon appears in the notification area.
+The program starts immediately even if no devices are detected (e.g. when launched at startup before audio drivers are ready, or via Remote Desktop). It waits silently and starts the AEC pipeline automatically when all required devices become available — on session unlock or physical console login.
 
 ### 4. Set the Virtual Mic in Your App
 
@@ -76,13 +76,13 @@ rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 
 ### Positional Arguments
 
-All positional arguments are optional. Each is a case-insensitive substring matched against the device's friendly name.
+All positional arguments are optional. Each is a case-insensitive substring matched against the device's friendly name. If an argument is omitted or no matching device exists at startup, the app waits and retries on the next session unlock or console connect.
 
 | Argument | Default | Example |
 |---|---|---|
 | `mic_name` | First real (non-cable) microphone | `"Realtek"` |
 | `speaker_name` | Windows default speakers | `"Speakers"` |
-| `output_name` | Auto-detect device with "cable" in name | `"CABLE Input"` |
+| `output_name` | Device with "cable input" in name | `"CABLE Input"` |
 
 **Examples:**
 
@@ -104,12 +104,19 @@ rust_aec.exe --verbose "Realtek" "Speakers (Realtek)" "CABLE Input"
 
 The application runs in the Windows notification area (system tray). Right-click the tray icon to:
 
-- **Microphone** — Select which capture device to use (radio-button selection)
+- **Microphone** — Select which capture device to use (radio-button selection; shows "No devices found" if none are active)
 - **Speaker (Loopback)** — Select which render device to capture system audio from
+- **Output (Cable)** — Select which render device to write clean audio to (typically CABLE Input)
 - **Start with Windows** — Toggle automatic startup (adds/removes a registry entry in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
 - **Exit** — Stop the AEC engine and quit
 
-Device changes take effect immediately — the audio pipeline restarts with the new device.
+Device changes take effect immediately — the audio pipeline restarts with the new device. Device lists are refreshed each time the menu is opened.
+
+### Remote Desktop & Startup Behaviour
+
+- When launched with no audio devices available (e.g. Remote Desktop, early autostart), the app starts silently with a tray icon and waits.
+- On **session unlock** or **physical console login**, it re-enumerates devices and starts the pipeline automatically.
+- No error dialogs or crashes — the app is always running and ready.
 
 ## Project Structure
 
@@ -145,6 +152,7 @@ resources/
 | Channels | Mono (downmixed internally) |
 | Format support | f32 and i16 PCM |
 | Buffer size | 200ms ring buffers |
+| Rust edition | 2024 |
 
 ### Architecture
 
@@ -156,17 +164,17 @@ Engine thread:     AEC processing loop (reads mic + reference, writes output)
   render:          out ring buffer → WASAPI virtual cable
 ```
 
-Commands flow from the tray to the engine via a crossbeam channel. Device changes trigger a full pipeline restart (stop threads, rebuild ring buffers, respawn).
+Commands flow from the tray to the engine via a crossbeam channel (`SetMicDevice`, `SetSpeakerDevice`, `SetOutputDevice`, `RefreshDevices`, `Shutdown`). Device changes trigger a full pipeline restart. `RefreshDevices` is sent automatically on Windows session unlock and console connect events (via `WTSRegisterSessionNotification`).
 
 ## Troubleshooting
 
-**"No virtual audio cable found"**
-- Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) and restart the program.
-- Or pass the output device name explicitly: `rust_aec.exe "" "" "My Cable Device"`.
+**No tray menu submenus show a device**
+- The cable or mic drivers may not have initialised yet. Wait a moment and right-click again — the list refreshes each time.
+- Alternatively, lock and unlock the session to trigger an automatic device refresh.
 
 **No echo cancellation effect**
-- Make sure the correct speaker device is selected for loopback (the one actually playing audio).
-- Right-click the tray icon and verify the correct speaker is selected.
+- Make sure the correct speaker device is selected under **Speaker (Loopback)** — it must be the device actually playing audio.
+- Make sure **Output (Cable)** is set to **CABLE Input**.
 
 **Other app still hears echo**
 - Confirm the app's input device is set to **CABLE Output**, not your physical microphone.
@@ -174,3 +182,6 @@ Commands flow from the tray to the engine via a crossbeam channel. Device change
 **Tray icon not visible**
 - Check the Windows notification area overflow (click the ^ arrow in the taskbar).
 - Run with `--verbose` to see console output and verify the program is running.
+
+**Works via Remote Desktop but not physically (or vice versa)**
+- Lock and unlock the session — this triggers a device refresh and restarts the pipeline.

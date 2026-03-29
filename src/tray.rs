@@ -27,6 +27,7 @@ const WTS_SESSION_UNLOCK: u32 = 0x8;
 // Menu item ID ranges.
 const ID_MIC_BASE: u32 = 1000;
 const ID_SPEAKER_BASE: u32 = 1100;
+const ID_OUTPUT_BASE: u32 = 1200;
 const ID_AUTOSTART: u32 = 2000;
 const ID_EXIT: u32 = 9999;
 
@@ -274,6 +275,51 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
         let _ = InsertMenuItemW(menu, 1, true, &mii);
     }
 
+    // Output (virtual cable) submenu.
+    let output_menu = CreatePopupMenu().unwrap();
+    if st.render_devices.is_empty() {
+        let mut label = wide("No devices found");
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_STATE,
+            fState: MFS_DISABLED,
+            dwTypeData: PWSTR(label.as_mut_ptr()),
+            cch: label.len() as u32 - 1,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(output_menu, 0, true, &mii);
+    }
+    for (i, dev) in st.render_devices.iter().enumerate() {
+        let mut label = wide(&dev.name);
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE,
+            fType: MFT_RADIOCHECK,
+            fState: if Some(&dev.id) == st.current_output_id.as_ref() {
+                MFS_CHECKED
+            } else {
+                MFS_UNCHECKED
+            },
+            wID: ID_OUTPUT_BASE + i as u32,
+            dwTypeData: PWSTR(label.as_mut_ptr()),
+            cch: label.len() as u32 - 1,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(output_menu, i as u32, true, &mii);
+    }
+    {
+        let mut label = wide("Output (Cable)");
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING | MIIM_SUBMENU,
+            hSubMenu: output_menu,
+            dwTypeData: PWSTR(label.as_mut_ptr()),
+            cch: label.len() as u32 - 1,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(menu, 2, true, &mii);
+    }
+
     // Separator.
     {
         let mii = MENUITEMINFOW {
@@ -282,7 +328,7 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
             fType: MFT_SEPARATOR,
             ..Default::default()
         };
-        let _ = InsertMenuItemW(menu, 2, true, &mii);
+        let _ = InsertMenuItemW(menu, 3, true, &mii);
     }
 
     // Autostart toggle.
@@ -302,7 +348,7 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
             cch: label.len() as u32 - 1,
             ..Default::default()
         };
-        let _ = InsertMenuItemW(menu, 3, true, &mii);
+        let _ = InsertMenuItemW(menu, 4, true, &mii);
     }
 
     // Separator.
@@ -313,7 +359,7 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
             fType: MFT_SEPARATOR,
             ..Default::default()
         };
-        let _ = InsertMenuItemW(menu, 4, true, &mii);
+        let _ = InsertMenuItemW(menu, 5, true, &mii);
     }
 
     // Exit.
@@ -327,7 +373,7 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
             cch: label.len() as u32 - 1,
             ..Default::default()
         };
-        let _ = InsertMenuItemW(menu, 5, true, &mii);
+        let _ = InsertMenuItemW(menu, 6, true, &mii);
     }
 
     drop(st);
@@ -363,6 +409,15 @@ unsafe fn handle_menu_command(id: u32) { unsafe {
         };
         if let Some(new_id) = device_id {
             let _ = ctx.cmd_tx.send(EngineCommand::SetSpeakerDevice(new_id));
+        }
+    } else if id >= ID_OUTPUT_BASE && id < ID_OUTPUT_BASE + 100 {
+        let idx = (id - ID_OUTPUT_BASE) as usize;
+        let device_id = {
+            let st = ctx.state.lock().unwrap();
+            st.render_devices.get(idx).map(|d| d.id.clone())
+        };
+        if let Some(new_id) = device_id {
+            let _ = ctx.cmd_tx.send(EngineCommand::SetOutputDevice(new_id));
         }
     } else if id == ID_AUTOSTART {
         if autostart::is_autostart_enabled() {
