@@ -34,8 +34,8 @@ pub struct TrayState {
     pub capture_devices: Vec<DeviceInfo>,
     pub render_devices: Vec<DeviceInfo>,
     pub current_mic_id: Option<String>,
-    pub current_speaker_id: String,
-    pub current_output_id: String,
+    pub current_speaker_id: Option<String>,
+    pub current_output_id: Option<String>,
 }
 
 struct TrayContext {
@@ -225,7 +225,7 @@ unsafe fn handle_right_click(hwnd: HWND) {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
             fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE,
             fType: MFT_RADIOCHECK,
-            fState: if dev.id == st.current_speaker_id {
+            fState: if Some(&dev.id) == st.current_speaker_id.as_ref() {
                 MFS_CHECKED
             } else {
                 MFS_UNCHECKED

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use crossbeam_channel::Receiver;
 
 use crate::aec::{AecProcessor, FRAME_SIZE, SAMPLE_RATE};
@@ -110,10 +110,8 @@ impl Pipeline {
 
 impl AudioEngine {
     /// Try to find a mic by re-enumerating capture devices.
-    /// Updates state and returns the mic id if found.
-    fn try_find_mic(&self) -> Option<String> {
+    fn try_find_mic(state: &Mutex<TrayState>) -> Option<String> {
         let capture = device::list_capture_devices().ok()?;
-        // Try default first.
         let mic_id = match device::default_capture_device_id() {
             Ok(default_id) => {
                 let name = device::device_name_by_id(&capture, &default_id);
@@ -125,18 +123,35 @@ impl AudioEngine {
             }
             Err(_) => device::find_real_capture_device(&capture).ok(),
         };
-        if mic_id.is_some() {
-            let mut st = self.state.lock().unwrap();
-            st.capture_devices = capture;
-            st.current_mic_id = mic_id.clone();
-        }
+        let mut st = state.lock().unwrap();
+        st.capture_devices = capture;
+        st.current_mic_id = mic_id.clone();
         mic_id
     }
 
-    pub fn run(&self) -> Result<()> {
-        device::com_init()?;
+    /// Try to find a speaker (default render device).
+    fn try_find_speaker(state: &Mutex<TrayState>) -> Option<String> {
+        let render = device::list_render_devices().ok()?;
+        let speaker_id = device::default_render_device_id().ok();
+        let mut st = state.lock().unwrap();
+        st.render_devices = render;
+        st.current_speaker_id = speaker_id.clone();
+        speaker_id
+    }
 
-        let (mut mic_id, speaker_id, output_id) = {
+    /// Try to find a virtual audio cable output device.
+    fn try_find_output(state: &Mutex<TrayState>) -> Option<String> {
+        let render = device::list_render_devices().ok()?;
+        let output_id = device::find_device_id_by_name(&render, "cable").ok();
+        let mut st = state.lock().unwrap();
+        st.render_devices = render;
+        st.current_output_id = output_id.clone();
+        output_id
+    }
+
+    /// Refresh all missing devices from state. Returns (mic, speaker, output).
+    fn refresh_missing(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let (mic, spk, out) = {
             let st = self.state.lock().unwrap();
             (
                 st.current_mic_id.clone(),
@@ -144,10 +159,35 @@ impl AudioEngine {
                 st.current_output_id.clone(),
             )
         };
+        let mic = mic.or_else(|| Self::try_find_mic(&self.state));
+        let spk = spk.or_else(|| Self::try_find_speaker(&self.state));
+        let out = out.or_else(|| Self::try_find_output(&self.state));
+        (mic, spk, out)
+    }
 
-        if output_id.is_empty() {
-            bail!("No output device configured");
+    /// Try to start the pipeline if all devices are available.
+    fn try_start_pipeline(
+        mic_id: &Option<String>,
+        speaker_id: &Option<String>,
+        output_id: &Option<String>,
+    ) -> Option<Result<Pipeline>> {
+        match (mic_id.as_ref(), speaker_id.as_ref(), output_id.as_ref()) {
+            (Some(m), Some(s), Some(o)) => Some(Pipeline::new(m, s, o)),
+            _ => None,
         }
+    }
+
+    pub fn run(&self) -> Result<()> {
+        device::com_init()?;
+
+        let (mut mic_id, mut speaker_id, mut output_id) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.current_mic_id.clone(),
+                st.current_speaker_id.clone(),
+                st.current_output_id.clone(),
+            )
+        };
 
         let mut pipeline: Option<Pipeline> = None;
         let mut processor: Option<AecProcessor> = None;
@@ -157,23 +197,30 @@ impl AudioEngine {
         let mut frames_processed: u64 = 0;
         let mut last_report = Instant::now();
 
-        // Start pipeline if mic is available.
-        if let Some(ref mid) = mic_id {
-            match Pipeline::new(mid, &speaker_id, &output_id) {
-                Ok(p) => {
-                    pipeline = Some(p);
-                    processor = Some(AecProcessor::new()?);
+        // Start pipeline if all devices are available.
+        match Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
+            Some(Ok(p)) => {
+                pipeline = Some(p);
+                processor = Some(AecProcessor::new()?);
+            }
+            Some(Err(e)) => {
+                if self.verbose {
+                    eprintln!("[engine] Failed to start pipeline: {:#}", e);
                 }
-                Err(e) => {
-                    if self.verbose {
-                        eprintln!("[engine] Failed to start pipeline: {:#}", e);
-                    }
-                    mic_id = None;
-                    self.state.lock().unwrap().current_mic_id = None;
+                // Clear whichever device caused the failure and wait.
+                mic_id = None;
+                self.state.lock().unwrap().current_mic_id = None;
+            }
+            None => {
+                if self.verbose {
+                    eprintln!(
+                        "[engine] Waiting for devices (mic={}, speaker={}, output={})...",
+                        mic_id.is_some(),
+                        speaker_id.is_some(),
+                        output_id.is_some(),
+                    );
                 }
             }
-        } else if self.verbose {
-            eprintln!("[engine] No microphone available, waiting for device...");
         }
 
         loop {
@@ -188,112 +235,72 @@ impl AudioEngine {
                 Ok(EngineCommand::SetMicDevice(new_id)) => {
                     if let Some(ref mut p) = pipeline {
                         p.shutdown();
+                        pipeline = None;
+                        processor = None;
                     }
-                    {
-                        let mut st = self.state.lock().unwrap();
-                        st.current_mic_id = Some(new_id.clone());
-                    }
-                    mic_id = Some(new_id);
-                    let st = self.state.lock().unwrap();
-                    pipeline = Some(Pipeline::new(
-                        mic_id.as_ref().unwrap(),
-                        &st.current_speaker_id,
-                        &st.current_output_id,
-                    )?);
-                    drop(st);
-                    processor = Some(AecProcessor::new()?);
-                    frames_processed = 0;
-                    if self.verbose {
-                        eprintln!("[engine] Switched mic device, pipeline restarted.");
+                    mic_id = Some(new_id.clone());
+                    self.state.lock().unwrap().current_mic_id = Some(new_id);
+                    if let Some(result) = Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
+                        pipeline = Some(result?);
+                        processor = Some(AecProcessor::new()?);
+                        frames_processed = 0;
+                        if self.verbose {
+                            eprintln!("[engine] Switched mic device, pipeline restarted.");
+                        }
                     }
                 }
                 Ok(EngineCommand::SetSpeakerDevice(new_id)) => {
                     if let Some(ref mut p) = pipeline {
                         p.shutdown();
+                        pipeline = None;
+                        processor = None;
                     }
-                    {
-                        let mut st = self.state.lock().unwrap();
-                        st.current_speaker_id = new_id;
-                    }
-                    let st = self.state.lock().unwrap();
-                    if let Some(ref mid) = mic_id {
-                        pipeline = Some(Pipeline::new(
-                            mid,
-                            &st.current_speaker_id,
-                            &st.current_output_id,
-                        )?);
+                    speaker_id = Some(new_id.clone());
+                    self.state.lock().unwrap().current_speaker_id = Some(new_id);
+                    if let Some(result) = Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
+                        pipeline = Some(result?);
                         processor = Some(AecProcessor::new()?);
                         frames_processed = 0;
                         if self.verbose {
                             eprintln!("[engine] Switched speaker device, pipeline restarted.");
                         }
                     }
-                    drop(st);
                 }
                 Ok(EngineCommand::RefreshDevices) => {
                     if self.verbose {
                         eprintln!("[engine] Refreshing devices...");
                     }
-                    // If we don't have a mic yet, try to find one.
-                    if mic_id.is_none() {
-                        if let Some(new_mic) = self.try_find_mic() {
-                            mic_id = Some(new_mic);
-                            let st = self.state.lock().unwrap();
-                            match Pipeline::new(
-                                mic_id.as_ref().unwrap(),
-                                &st.current_speaker_id,
-                                &st.current_output_id,
-                            ) {
-                                Ok(p) => {
-                                    pipeline = Some(p);
-                                    processor = Some(AecProcessor::new()?);
-                                    frames_processed = 0;
-                                    if self.verbose {
-                                        eprintln!("[engine] Microphone found, pipeline started.");
-                                    }
-                                }
-                                Err(e) => {
-                                    if self.verbose {
-                                        eprintln!("[engine] Failed to start pipeline: {:#}", e);
-                                    }
-                                    mic_id = None;
-                                    drop(st);
-                                    self.state.lock().unwrap().current_mic_id = None;
-                                }
+                    if let Some(ref mut p) = pipeline {
+                        p.shutdown();
+                        pipeline = None;
+                        processor = None;
+                    }
+                    let (new_mic, new_spk, new_out) = self.refresh_missing();
+                    mic_id = new_mic;
+                    speaker_id = new_spk;
+                    output_id = new_out;
+                    match Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
+                        Some(Ok(p)) => {
+                            pipeline = Some(p);
+                            processor = Some(AecProcessor::new()?);
+                            frames_processed = 0;
+                            if self.verbose {
+                                eprintln!("[engine] Pipeline (re)started after device refresh.");
                             }
                         }
-                    } else {
-                        // Already have a mic — restart pipeline (devices may have changed).
-                        if let Some(ref mut p) = pipeline {
-                            p.shutdown();
-                        }
-                        // Re-enumerate and pick best mic.
-                        if let Some(new_mic) = self.try_find_mic() {
-                            mic_id = Some(new_mic);
-                        }
-                        let st = self.state.lock().unwrap();
-                        match Pipeline::new(
-                            mic_id.as_ref().unwrap(),
-                            &st.current_speaker_id,
-                            &st.current_output_id,
-                        ) {
-                            Ok(p) => {
-                                pipeline = Some(p);
-                                processor = Some(AecProcessor::new()?);
-                                frames_processed = 0;
-                                if self.verbose {
-                                    eprintln!("[engine] Pipeline restarted after device refresh.");
-                                }
+                        Some(Err(e)) => {
+                            if self.verbose {
+                                eprintln!("[engine] Failed to start pipeline: {:#}", e);
                             }
-                            Err(e) => {
-                                if self.verbose {
-                                    eprintln!("[engine] Failed to restart pipeline: {:#}", e);
-                                }
-                                pipeline = None;
-                                processor = None;
-                                mic_id = None;
-                                drop(st);
-                                self.state.lock().unwrap().current_mic_id = None;
+                        }
+                        None => {
+                            if self.verbose {
+                                eprintln!(
+                                    "[engine] Still waiting for devices (mic={}, speaker={}, output={}).",
+                                    mic_id.is_some(),
+                                    speaker_id.is_some(),
+                                    output_id.is_some(),
+                                );
                             }
                         }
                     }

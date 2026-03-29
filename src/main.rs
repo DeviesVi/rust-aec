@@ -16,7 +16,7 @@ mod tray;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::audio::device;
 use crate::engine::{AudioEngine, EngineCommand};
@@ -136,25 +136,37 @@ fn run(verbose: bool) -> Result<()> {
     };
 
     // Select speaker for loopback.
-    let speaker_id = if let Some(q) = speaker_query {
-        device::find_device_id_by_name(&render_devices, q)
-            .context("Speaker device not found")?
+    let speaker_id: Option<String> = if let Some(q) = speaker_query {
+        Some(
+            device::find_device_id_by_name(&render_devices, q)
+                .context("Speaker device not found")?,
+        )
     } else {
-        device::default_render_device_id()?
+        match device::default_render_device_id() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                if verbose {
+                    println!("No render device found, starting without speaker.");
+                }
+                None
+            }
+        }
     };
 
     // Select output virtual cable.
-    let output_id = if let Some(q) = output_query {
-        device::find_device_id_by_name(&render_devices, q)
-            .context("Output virtual cable device not found")?
+    let output_id: Option<String> = if let Some(q) = output_query {
+        Some(
+            device::find_device_id_by_name(&render_devices, q)
+                .context("Output virtual cable device not found")?,
+        )
     } else {
         match device::find_device_id_by_name(&render_devices, "cable") {
-            Ok(id) => id,
+            Ok(id) => Some(id),
             Err(_) => {
-                bail!(
-                    "No virtual audio cable found. Install VB-Audio Virtual Cable \
-                     or pass the output device name as an argument."
-                );
+                if verbose {
+                    println!("No virtual audio cable found, starting without output.");
+                }
+                None
             }
         }
     };
@@ -167,14 +179,20 @@ fn run(verbose: bool) -> Result<()> {
             ),
             None => println!("Mic: (none)"),
         }
-        println!(
-            "Speaker: {}",
-            device::device_name_by_id(&render_devices, &speaker_id)
-        );
-        println!(
-            "Output: {}",
-            device::device_name_by_id(&render_devices, &output_id)
-        );
+        match &speaker_id {
+            Some(id) => println!(
+                "Speaker: {}",
+                device::device_name_by_id(&render_devices, id)
+            ),
+            None => println!("Speaker: (none)"),
+        }
+        match &output_id {
+            Some(id) => println!(
+                "Output: {}",
+                device::device_name_by_id(&render_devices, id)
+            ),
+            None => println!("Output: (none)"),
+        }
     }
 
     // --- Shared state and command channel ---
