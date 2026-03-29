@@ -52,6 +52,11 @@ pub fn render_loop(
         let device_rate = wfx.nSamplesPerSec as usize;
         let bits = wfx.wBitsPerSample;
 
+        println!(
+            "[render] device: channels={}, rate={}, bits={}, buffer_size={}",
+            device_channels, device_rate, bits, buffer_size
+        );
+
         while !stop.load(Ordering::Relaxed) {
             let _ = WaitForSingleObject(event, 100);
 
@@ -71,7 +76,12 @@ pub fn render_loop(
 
             let mut mono_buf = vec![0.0f32; mono_frames_needed];
             let read = consumer.pop(&mut mono_buf);
+
+            // If no data, write silence to keep the WASAPI stream alive.
             if read == 0 {
+                let buffer = render_client.GetBuffer(available_frames as u32)?;
+                std::ptr::write_bytes(buffer, 0u8, available_frames * device_channels * (bits as usize / 8));
+                render_client.ReleaseBuffer(available_frames as u32, 0)?;
                 continue;
             }
             mono_buf.truncate(read);

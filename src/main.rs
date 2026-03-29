@@ -3,163 +3,165 @@
 // Captures microphone audio (WASAPI), captures speaker loopback (WASAPI),
 // runs echo cancellation (sonora AEC3), and outputs clean audio to a
 // virtual audio cable device.
+//
+// Runs as a system tray application. Pass --verbose for console diagnostics.
 
 mod aec;
 mod audio;
+mod autostart;
+mod engine;
 mod sync;
+mod tray;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{bail, Context, Result};
 
-use crate::aec::{AecProcessor, FRAME_SIZE, SAMPLE_RATE};
 use crate::audio::device;
-use crate::sync::AudioRingBuf;
+use crate::engine::{AudioEngine, EngineCommand};
+use crate::tray::TrayState;
 
 fn main() -> Result<()> {
+    let verbose = std::env::args().any(|a| a == "--verbose" || a == "-v");
+
+    // Hide the console window unless --verbose is passed.
+    if !verbose {
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
+    }
+
     device::com_init()?;
 
-    // --- Device selection ---
-    let args: Vec<String> = std::env::args().collect();
-    let mic_query = args.get(1).map(String::as_str);
-    let speaker_query = args.get(2).map(String::as_str);
-    let output_query = args.get(3).map(String::as_str);
-
-    // List available devices.
+    // --- Device enumeration ---
     let capture_devices = device::list_capture_devices()?;
     let render_devices = device::list_render_devices()?;
 
-    println!("=== Capture devices (microphones) ===");
-    for d in &capture_devices {
-        println!("  [{}] {}", d.index, d.name);
+    if verbose {
+        println!("=== Capture devices (microphones) ===");
+        for d in &capture_devices {
+            println!("  [{}] {}", d.index, d.name);
+        }
+        println!("=== Render devices (speakers / virtual cables) ===");
+        for d in &render_devices {
+            println!("  [{}] {}", d.index, d.name);
+        }
+        println!();
     }
-    println!("=== Render devices (speakers / virtual cables) ===");
-    for d in &render_devices {
-        println!("  [{}] {}", d.index, d.name);
-    }
-    println!();
 
-    // Select mic device ID.
+    // --- CLI device selection ---
+    let args: Vec<String> = std::env::args().collect();
+    // Skip flags like --verbose when looking for positional args.
+    let positional: Vec<&str> = args[1..]
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+
+    let mic_query = positional.first().copied();
+    let speaker_query = positional.get(1).copied();
+    let output_query = positional.get(2).copied();
+
+    // Select mic: user arg > default (if not a cable) > first real mic.
     let mic_id = if let Some(q) = mic_query {
         device::find_device_id_by_name(&capture_devices, q)
             .context("Mic device not found")?
     } else {
-        println!("No mic specified, using default capture device.");
-        device::default_capture_device_id()?
+        let default_id = device::default_capture_device_id()?;
+        let default_name = device::device_name_by_id(&capture_devices, &default_id);
+        if device::is_virtual_cable(&default_name) {
+            if verbose {
+                println!(
+                    "Default capture device '{}' is a virtual cable, looking for a real mic...",
+                    default_name
+                );
+            }
+            device::find_real_capture_device(&capture_devices)?
+        } else {
+            default_id
+        }
     };
 
-    // Select speaker device ID for loopback.
+    // Select speaker for loopback.
     let speaker_id = if let Some(q) = speaker_query {
         device::find_device_id_by_name(&render_devices, q)
             .context("Speaker device not found")?
     } else {
-        println!("No speaker specified, using default render device for loopback.");
         device::default_render_device_id()?
     };
 
-    // Select output virtual cable device ID.
+    // Select output virtual cable.
     let output_id = if let Some(q) = output_query {
         device::find_device_id_by_name(&render_devices, q)
             .context("Output virtual cable device not found")?
     } else {
         match device::find_device_id_by_name(&render_devices, "cable") {
-            Ok(id) => {
-                println!("Auto-detected virtual cable.");
-                id
-            }
+            Ok(id) => id,
             Err(_) => {
                 bail!(
                     "No virtual audio cable found. Install VB-Audio Virtual Cable \
-                     or pass the output device name as the 3rd argument."
+                     or pass the output device name as an argument."
                 );
             }
         }
     };
 
-    println!(
-        "Starting AEC: sample_rate={}Hz, frame_size={} samples ({}ms)",
-        SAMPLE_RATE,
-        FRAME_SIZE,
-        FRAME_SIZE * 1000 / SAMPLE_RATE
-    );
+    if verbose {
+        println!(
+            "Mic: {}",
+            device::device_name_by_id(&capture_devices, &mic_id)
+        );
+        println!(
+            "Speaker: {}",
+            device::device_name_by_id(&render_devices, &speaker_id)
+        );
+        println!(
+            "Output: {}",
+            device::device_name_by_id(&render_devices, &output_id)
+        );
+    }
 
-    // --- Ring buffers ---
-    let buf_capacity = SAMPLE_RATE / 5; // 200ms
-    let mic_ring = AudioRingBuf::new(buf_capacity);
-    let ref_ring = AudioRingBuf::new(buf_capacity);
-    let out_ring = AudioRingBuf::new(buf_capacity);
+    // --- Shared state and command channel ---
+    let state = Arc::new(Mutex::new(TrayState {
+        capture_devices,
+        render_devices,
+        current_mic_id: mic_id,
+        current_speaker_id: speaker_id,
+        current_output_id: output_id,
+    }));
 
-    let (mic_prod, mic_cons) = mic_ring.split();
-    let (ref_prod, ref_cons) = ref_ring.split();
-    let (out_prod, out_cons) = out_ring.split();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EngineCommand>();
 
     // --- Ctrl+C handler ---
-    let stop = Arc::new(AtomicBool::new(false));
     {
-        let stop = stop.clone();
+        let cmd_tx = cmd_tx.clone();
         ctrlc::set_handler(move || {
-            println!("\nShutting down...");
-            stop.store(true, Ordering::SeqCst);
+            let _ = cmd_tx.send(EngineCommand::Shutdown);
         })
-        .context("Failed to set Ctrl+C handler")?;
+        .ok();
     }
 
-    // --- Spawn threads (pass device IDs, re-open on each thread) ---
-    let stop_mic = stop.clone();
-    let mic_thread = thread::Builder::new()
-        .name("mic-capture".into())
+    // --- Spawn engine thread ---
+    let engine_state = state.clone();
+    let engine_thread = thread::Builder::new()
+        .name("aec-engine".into())
         .spawn(move || {
-            device::com_init().expect("COM init failed in mic thread");
-            audio::capture::capture_loop(&mic_id, mic_prod, stop_mic)
+            let engine = AudioEngine {
+                cmd_rx,
+                state: engine_state,
+                verbose,
+            };
+            if let Err(e) = engine.run() {
+                eprintln!("[error] engine: {:#}", e);
+            }
         })?;
 
-    let stop_ref = stop.clone();
-    let ref_thread = thread::Builder::new()
-        .name("loopback-capture".into())
-        .spawn(move || {
-            device::com_init().expect("COM init failed in loopback thread");
-            audio::loopback::loopback_loop(&speaker_id, ref_prod, stop_ref)
-        })?;
+    // --- Run system tray on main thread (message pump) ---
+    tray::run_tray(state, cmd_tx)?;
 
-    let stop_out = stop.clone();
-    let out_thread = thread::Builder::new()
-        .name("render".into())
-        .spawn(move || {
-            device::com_init().expect("COM init failed in render thread");
-            audio::render::render_loop(&output_id, out_cons, stop_out)
-        })?;
+    // Tray message pump exited — wait for engine.
+    engine_thread.join().ok();
 
-    // --- AEC processing on main thread ---
-    let mut processor = AecProcessor::new()?;
-    let mut mic_frame = vec![0.0f32; FRAME_SIZE];
-    let mut ref_frame = vec![0.0f32; FRAME_SIZE];
-    let mut out_frame = vec![0.0f32; FRAME_SIZE];
-    let mut mic_cons = mic_cons;
-    let mut ref_cons = ref_cons;
-    let mut out_prod = out_prod;
-
-    println!("AEC running. Press Ctrl+C to stop.");
-
-    while !stop.load(Ordering::Relaxed) {
-        if mic_cons.available() < FRAME_SIZE || ref_cons.available() < FRAME_SIZE {
-            thread::sleep(std::time::Duration::from_millis(1));
-            continue;
-        }
-
-        mic_cons.pop(&mut mic_frame);
-        ref_cons.pop(&mut ref_frame);
-
-        processor.process_frame(&mic_frame, &ref_frame, &mut out_frame);
-
-        out_prod.push(&out_frame);
-    }
-
-    let _ = mic_thread.join();
-    let _ = ref_thread.join();
-    let _ = out_thread.join();
-
-    println!("Done.");
     Ok(())
 }

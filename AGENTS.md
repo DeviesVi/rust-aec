@@ -2,18 +2,21 @@
 
 ## Project Overview
 
-Real-time Acoustic Echo Cancellation (AEC) for Windows. Captures microphone + speaker loopback via WASAPI, runs WebRTC AEC3 (sonora), and outputs clean audio to a virtual audio cable so other apps (Discord, Zoom, Teams, etc.) can use it as their microphone input.
+Real-time Acoustic Echo Cancellation (AEC) for Windows. Captures microphone + speaker loopback via WASAPI, runs WebRTC AEC3 (sonora), and outputs clean audio to a virtual audio cable so other apps (Discord, Zoom, Teams, etc.) can use it as their microphone input. Runs as a system tray application.
 
 ## Architecture
 
 ```
-Physical Mic ──► [capture thread] ──► mic_ring ──┐
-                                                  ├──► [main thread: AEC] ──► out_ring ──► [render thread] ──► Virtual Cable
-Speaker Output ──► [loopback thread] ──► ref_ring ┘
+Main thread:       Win32 message pump + system tray icon (src/tray.rs)
+Engine thread:     AEC processing loop (src/engine.rs)
+  mic-capture:     WASAPI capture → mic_ring (src/audio/capture.rs)
+  loopback:        WASAPI loopback → ref_ring (src/audio/loopback.rs)
+  render:          out_ring → Virtual Cable (src/audio/render.rs)
 ```
 
-- **3 threads + main**: mic-capture, loopback-capture, render (each init COM separately). Main thread runs AEC loop.
-- **Inter-thread comms**: lock-free SPSC ring buffers (`ringbuf` crate), 200ms capacity.
+- **Main thread**: Runs Win32 message pump for the system tray icon. Sends `EngineCommand` to the engine thread via `crossbeam-channel`.
+- **Engine thread**: Owns the AEC processor + 3 audio threads + ring buffers. Handles device hot-swap by rebuilding the full pipeline.
+- **Inter-thread comms**: Lock-free SPSC ring buffers (`ringbuf` crate), 200ms capacity. Commands via `crossbeam-channel`.
 - **Processing**: 10ms frames (480 samples @ 48kHz). AEC via `sonora` (pure-Rust WebRTC AEC3 port).
 - **Audio API**: WASAPI directly via the `windows` crate (v0.58). Windows-only.
 
@@ -21,73 +24,43 @@ Speaker Output ──► [loopback thread] ──► ref_ring ┘
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | CLI arg parsing, device selection, thread spawn, AEC processing loop |
-| `src/audio/device.rs` | WASAPI device enumeration (`IMMDeviceEnumerator`), substring matching |
+| `src/main.rs` | CLI parsing, device selection (with cable filtering), tray + engine startup |
+| `src/engine.rs` | `AudioEngine` — AEC processing loop, audio thread lifecycle, `EngineCommand` handling |
+| `src/tray.rs` | Win32 system tray icon, context menus, `TrayState` shared with engine |
+| `src/autostart.rs` | Registry-based Windows autostart (`HKCU\...\Run`) |
+| `src/audio/device.rs` | WASAPI device enumeration, substring matching, virtual cable detection |
 | `src/audio/capture.rs` | Mic capture thread (shared mode, event-driven, 10ms buffer) |
 | `src/audio/loopback.rs` | Speaker loopback capture (`AUDCLNT_STREAMFLAGS_LOOPBACK`) |
 | `src/audio/render.rs` | Writes clean audio to virtual cable render endpoint |
-| `src/aec/mod.rs` | `AecProcessor` wrapping `sonora::aec3` |
+| `src/aec/mod.rs` | `AecProcessor` wrapping `sonora::AudioProcessing` |
 | `src/sync/mod.rs` | `AudioRingBuf` — SPSC ring buffer wrapper |
+| `build.rs` | Embeds `resources/app.ico` via `embed-resource` |
 
 ## CLI Usage
 
 ```
-rust_aec.exe [mic_name] [speaker_name] [output_name]
+rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 ```
 
-All arguments are optional substring matches (case-insensitive):
-- **mic_name**: Microphone device. Default: Windows default capture device.
+- `--verbose` / `-v`: Show console with diagnostics. Without this, the console is hidden (FreeConsole).
+- All positional arguments are optional substring matches (case-insensitive).
+- **mic_name**: Microphone device. Default: first real (non-virtual-cable) capture device.
 - **speaker_name**: Speaker for loopback. Default: Windows default render device.
 - **output_name**: Virtual cable output. Default: auto-detects device containing "cable".
 
 ## Virtual Audio Cable Setup (Required)
 
-The program outputs clean audio to a virtual audio cable. **You must install one** for other apps to receive the cleaned microphone signal.
+Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates "CABLE Input" (render) and "CABLE Output" (capture) devices.
 
-### Step 1: Install a Virtual Audio Cable
+## Key Design Decisions
 
-Install **one** of these:
-- [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free) — creates "CABLE Input" (render) and "CABLE Output" (capture) devices.
-- [VB-Audio VoiceMeeter](https://vb-audio.com/Voicemeeter/) — more advanced routing, also free.
-
-### Step 2: Run the AEC program
-
-```
-rust_aec.exe
-```
-
-It auto-detects devices named "cable". Or specify explicitly:
-
-```
-rust_aec.exe "Realtek" "Speakers" "CABLE Input"
-```
-
-### Step 3: Select the virtual cable as microphone in your app
-
-In Discord / Zoom / Teams / OBS / any app:
-1. Open audio/voice settings.
-2. Change **Input Device** (microphone) to **"CABLE Output"** (or equivalent name from your virtual cable software).
-3. That's it — the app now receives echo-cancelled audio.
-
-### How it works
-
-```
-Your Mic ──► rust_aec ──► "CABLE Input" (virtual speaker/render side)
-                                │
-                                ▼
-                          "CABLE Output" (virtual mic/capture side)
-                                │
-                                ▼
-                     Discord / Zoom / Teams picks this as mic
-```
-
-The virtual cable has two sides:
-- **Render side** ("CABLE Input"): rust_aec writes clean audio here.
-- **Capture side** ("CABLE Output"): Other apps read from here as a microphone.
+- **No tray crate**: Uses Win32 API directly (Shell_NotifyIconW, CreatePopupMenu, etc.) via the `windows` crate to avoid extra dependencies.
+- **Cable filtering**: When auto-selecting a microphone, devices with "cable" in the name are skipped to avoid selecting a virtual cable as input.
+- **Device hot-swap**: When the user changes a device via the tray menu, the entire audio pipeline is torn down and rebuilt. The AEC re-adapts in ~1-2 seconds.
+- **Shared state**: `TrayState` (device lists + current selections) is protected by `Arc<Mutex<>>`, accessed by both the tray (for menu building) and the engine (for device IDs).
 
 ## Development Notes
 
 - All audio conversion handles both f32 and i16 PCM formats, with mono mixdown and naive linear resampling when device sample rate != 48kHz.
-- `crossbeam-channel` is declared in Cargo.toml but unused — can be removed.
-- The `sonora` crate is the actual AEC engine (pure Rust), not `webrtc-audio-processing` as originally planned.
+- The `sonora` crate is the AEC engine (pure Rust WebRTC AEC3 port).
 - Loopback capture uses WASAPI's built-in loopback mode — no extra virtual device needed for capturing speaker output.

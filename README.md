@@ -2,6 +2,8 @@
 
 Real-time Acoustic Echo Cancellation for Windows. Removes speaker echo from your microphone and outputs clean audio to a virtual microphone that other apps (Discord, Zoom, Teams, OBS) can use.
 
+Runs as a **system tray application** with a notification area icon for device selection.
+
 ## How It Works
 
 ```
@@ -42,10 +44,14 @@ cargo build --release
 ### 3. Run
 
 ```sh
+# Normal mode — runs as a tray icon, no console output
 cargo run --release
+
+# Verbose mode — shows console with diagnostic output
+cargo run --release -- --verbose
 ```
 
-The program lists all detected audio devices, then starts processing. It auto-detects the VB-Audio cable by name.
+The program auto-detects the VB-Audio cable, selects a real microphone (skipping virtual cables), and starts processing. A system tray icon appears in the notification area.
 
 ### 4. Set the Virtual Mic in Your App
 
@@ -59,39 +65,62 @@ Your app now receives echo-cancelled audio.
 ## Usage
 
 ```
-rust_aec.exe [mic_name] [speaker_name] [output_name]
+rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 ```
 
-All arguments are optional. Each is a case-insensitive substring matched against the device's friendly name.
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--verbose`, `-v` | Show console window with diagnostic output (device lists, buffer levels, peak levels every 2s) |
+
+### Positional Arguments
+
+All positional arguments are optional. Each is a case-insensitive substring matched against the device's friendly name.
 
 | Argument | Default | Example |
 |---|---|---|
-| `mic_name` | Windows default mic | `"Realtek"` |
+| `mic_name` | First real (non-cable) microphone | `"Realtek"` |
 | `speaker_name` | Windows default speakers | `"Speakers"` |
 | `output_name` | Auto-detect device with "cable" in name | `"CABLE Input"` |
 
 **Examples:**
 
 ```sh
-# Use all defaults (auto-detect cable)
+# Use all defaults (auto-detect everything, tray icon only)
 rust_aec.exe
+
+# Verbose mode with all defaults
+rust_aec.exe --verbose
 
 # Specify microphone only
 rust_aec.exe "Realtek Microphone"
 
-# Specify all three devices
-rust_aec.exe "Realtek" "Speakers (Realtek)" "CABLE Input"
+# Specify all three devices with verbose output
+rust_aec.exe --verbose "Realtek" "Speakers (Realtek)" "CABLE Input"
 ```
 
-Press `Ctrl+C` to stop.
+## System Tray
+
+The application runs in the Windows notification area (system tray). Right-click the tray icon to:
+
+- **Microphone** — Select which capture device to use (radio-button selection)
+- **Speaker (Loopback)** — Select which render device to capture system audio from
+- **Start with Windows** — Toggle automatic startup (adds/removes a registry entry in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+- **Exit** — Stop the AEC engine and quit
+
+Device changes take effect immediately — the audio pipeline restarts with the new device.
 
 ## Project Structure
 
 ```
 src/
-  main.rs              # Device selection, thread orchestration, AEC loop
+  main.rs              # CLI parsing, device selection, tray + engine startup
+  engine.rs            # AEC processing loop + audio thread management
+  tray.rs              # Win32 system tray icon and context menus
+  autostart.rs         # Windows registry autostart (HKCU Run key)
   audio/
-    device.rs          # WASAPI device enumeration and selection
+    device.rs          # WASAPI device enumeration, cable filtering
     capture.rs         # Microphone capture thread
     loopback.rs        # Speaker loopback capture thread
     render.rs          # Clean audio output thread (writes to virtual cable)
@@ -99,6 +128,10 @@ src/
     mod.rs             # AEC processor (sonora WebRTC AEC3)
   sync/
     mod.rs             # Lock-free ring buffers for inter-thread audio
+build.rs               # Embeds app.ico via Windows resource compiler
+resources/
+  app.ico              # Application icon
+  app.rc               # Windows resource script
 ```
 
 ## Technical Details
@@ -113,7 +146,17 @@ src/
 | Format support | f32 and i16 PCM |
 | Buffer size | 200ms ring buffers |
 
-Audio flows through three dedicated threads (mic capture, loopback capture, render) communicating via lock-free SPSC ring buffers. The main thread runs the AEC processing loop.
+### Architecture
+
+```
+Main thread:       Win32 message pump + system tray icon
+Engine thread:     AEC processing loop (reads mic + reference, writes output)
+  mic-capture:     WASAPI capture → mic ring buffer
+  loopback:        WASAPI loopback → ref ring buffer
+  render:          out ring buffer → WASAPI virtual cable
+```
+
+Commands flow from the tray to the engine via a crossbeam channel. Device changes trigger a full pipeline restart (stop threads, rebuild ring buffers, respawn).
 
 ## Troubleshooting
 
@@ -123,7 +166,11 @@ Audio flows through three dedicated threads (mic capture, loopback capture, rend
 
 **No echo cancellation effect**
 - Make sure the correct speaker device is selected for loopback (the one actually playing audio).
-- Run with explicit device names to verify the right devices are selected.
+- Right-click the tray icon and verify the correct speaker is selected.
 
 **Other app still hears echo**
 - Confirm the app's input device is set to **CABLE Output**, not your physical microphone.
+
+**Tray icon not visible**
+- Check the Windows notification area overflow (click the ^ arrow in the taskbar).
+- Run with `--verbose` to see console output and verify the program is running.

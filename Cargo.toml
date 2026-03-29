@@ -1,6 +1,6 @@
 [package]
 name = "rust_aec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -21,4 +21,13 @@ features = [
     "Win32_Media_Audio",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+    "Win32_System_Console",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
 ]
+
+[build-dependencies]
+embed-resource = "3"

@@ -117,6 +117,12 @@ pub fn open_device_by_id(id: &str) -> Result<IMMDevice> {
     }
 }
 
+/// Returns true if the device name looks like a virtual audio cable.
+pub fn is_virtual_cable(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("cable")
+}
+
 /// Find a device by substring of its friendly name (case-insensitive). Returns its ID.
 pub fn find_device_id_by_name(devices: &[DeviceInfo], query: &str) -> Result<String> {
     let query_lower = query.to_lowercase();
@@ -126,4 +132,23 @@ pub fn find_device_id_by_name(devices: &[DeviceInfo], query: &str) -> Result<Str
         }
     }
     bail!("No device matching '{query}' found")
+}
+
+/// Find the first real (non-virtual-cable) capture device. Returns its ID.
+pub fn find_real_capture_device(devices: &[DeviceInfo]) -> Result<String> {
+    for info in devices {
+        if !is_virtual_cable(&info.name) {
+            return Ok(info.id.clone());
+        }
+    }
+    bail!("No real microphone found (all capture devices appear to be virtual cables)")
+}
+
+/// Get the device name for a given device ID, or "Unknown" if not found.
+pub fn device_name_by_id(devices: &[DeviceInfo], id: &str) -> String {
+    devices
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "Unknown".to_string())
 }

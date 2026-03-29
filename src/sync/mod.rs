@@ -38,6 +38,11 @@ impl AudioProducer {
     pub fn push(&mut self, data: &[f32]) -> usize {
         self.inner.push_slice(data)
     }
+
+    /// Number of samples waiting to be consumed.
+    pub fn available(&self) -> usize {
+        self.inner.occupied_len()
+    }
 }
 
 // SAFETY: The ring buffer producer is only used from one thread.
