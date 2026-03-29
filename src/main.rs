@@ -9,6 +9,7 @@
 mod aec;
 mod audio;
 mod autostart;
+mod config;
 mod engine;
 mod sync;
 mod tray;
@@ -103,13 +104,36 @@ fn run(verbose: bool) -> Result<()> {
     let speaker_query = positional.get(1).copied();
     let output_query = positional.get(2).copied();
 
-    // Select mic: user arg > default (if not a cable) > first real mic.
+    // Load persisted device choices (priority: CLI arg > saved config > auto-detect).
+    let cfg = config::load();
+
+    // Select mic: CLI arg > saved config ID > default (if not a cable) > first real mic.
     // Returns None when no mic is available (e.g. Remote Desktop with no audio).
     let mic_id: Option<String> = if let Some(q) = mic_query {
         Some(
             device::find_device_id_by_name(&capture_devices, q)
                 .context("Mic device not found")?,
         )
+    } else if let Some(id) = cfg.mic {
+        if capture_devices.iter().any(|d| d.id == id) {
+            if verbose {
+                println!("Mic: loaded from config ({})", device::device_name_by_id(&capture_devices, &id));
+            }
+            Some(id)
+        } else {
+            // Saved device no longer present — fall through to auto-detect.
+            match device::default_capture_device_id() {
+                Ok(default_id) => {
+                    let default_name = device::device_name_by_id(&capture_devices, &default_id);
+                    if device::is_virtual_cable(&default_name) {
+                        device::find_real_capture_device(&capture_devices).ok()
+                    } else {
+                        Some(default_id)
+                    }
+                }
+                Err(_) => None,
+            }
+        }
     } else {
         match device::default_capture_device_id() {
             Ok(default_id) => {
@@ -135,12 +159,21 @@ fn run(verbose: bool) -> Result<()> {
         }
     };
 
-    // Select speaker for loopback.
+    // Select speaker for loopback: CLI arg > saved config ID > default render device.
     let speaker_id: Option<String> = if let Some(q) = speaker_query {
         Some(
             device::find_device_id_by_name(&render_devices, q)
                 .context("Speaker device not found")?,
         )
+    } else if let Some(id) = cfg.speaker {
+        if render_devices.iter().any(|d| d.id == id) {
+            if verbose {
+                println!("Speaker: loaded from config ({})", device::device_name_by_id(&render_devices, &id));
+            }
+            Some(id)
+        } else {
+            device::default_render_device_id().ok()
+        }
     } else {
         match device::default_render_device_id() {
             Ok(id) => Some(id),
@@ -153,12 +186,21 @@ fn run(verbose: bool) -> Result<()> {
         }
     };
 
-    // Select output virtual cable.
+    // Select output virtual cable: CLI arg > saved config ID > device with "cable input" in name.
     let output_id: Option<String> = if let Some(q) = output_query {
         Some(
             device::find_device_id_by_name(&render_devices, q)
                 .context("Output virtual cable device not found")?,
         )
+    } else if let Some(id) = cfg.output {
+        if render_devices.iter().any(|d| d.id == id) {
+            if verbose {
+                println!("Output: loaded from config ({})", device::device_name_by_id(&render_devices, &id));
+            }
+            Some(id)
+        } else {
+            device::find_device_id_by_name(&render_devices, "cable input").ok()
+        }
     } else {
         match device::find_device_id_by_name(&render_devices, "cable input") {
             Ok(id) => Some(id),

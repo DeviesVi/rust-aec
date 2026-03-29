@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::audio::device::{self, DeviceInfo};
 use crate::autostart;
+use crate::config;
 use crate::engine::EngineCommand;
 
 const WM_TRAYICON: u32 = WM_APP + 1;
@@ -394,29 +395,29 @@ unsafe fn handle_menu_command(id: u32) { unsafe {
 
     if id >= ID_MIC_BASE && id < ID_MIC_BASE + 100 {
         let idx = (id - ID_MIC_BASE) as usize;
-        let device_id = {
-            let st = ctx.state.lock().unwrap();
-            st.capture_devices.get(idx).map(|d| d.id.clone())
-        };
-        if let Some(new_id) = device_id {
+        let st = ctx.state.lock().unwrap();
+        if let Some(dev) = st.capture_devices.get(idx) {
+            let new_id = dev.id.clone();
+            config::save(Some(&new_id), st.current_speaker_id.as_deref(), st.current_output_id.as_deref());
+            drop(st);
             let _ = ctx.cmd_tx.send(EngineCommand::SetMicDevice(new_id));
         }
     } else if id >= ID_SPEAKER_BASE && id < ID_SPEAKER_BASE + 100 {
         let idx = (id - ID_SPEAKER_BASE) as usize;
-        let device_id = {
-            let st = ctx.state.lock().unwrap();
-            st.render_devices.get(idx).map(|d| d.id.clone())
-        };
-        if let Some(new_id) = device_id {
+        let st = ctx.state.lock().unwrap();
+        if let Some(dev) = st.render_devices.get(idx) {
+            let new_id = dev.id.clone();
+            config::save(st.current_mic_id.as_deref(), Some(&new_id), st.current_output_id.as_deref());
+            drop(st);
             let _ = ctx.cmd_tx.send(EngineCommand::SetSpeakerDevice(new_id));
         }
     } else if id >= ID_OUTPUT_BASE && id < ID_OUTPUT_BASE + 100 {
         let idx = (id - ID_OUTPUT_BASE) as usize;
-        let device_id = {
-            let st = ctx.state.lock().unwrap();
-            st.render_devices.get(idx).map(|d| d.id.clone())
-        };
-        if let Some(new_id) = device_id {
+        let st = ctx.state.lock().unwrap();
+        if let Some(dev) = st.render_devices.get(idx) {
+            let new_id = dev.id.clone();
+            config::save(st.current_mic_id.as_deref(), st.current_speaker_id.as_deref(), Some(&new_id));
+            drop(st);
             let _ = ctx.cmd_tx.send(EngineCommand::SetOutputDevice(new_id));
         }
     } else if id == ID_AUTOSTART {

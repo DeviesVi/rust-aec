@@ -53,6 +53,8 @@ cargo run --release -- --verbose
 
 The program starts immediately even if no devices are detected (e.g. when launched at startup before audio drivers are ready, or via Remote Desktop). It waits silently and starts the AEC pipeline automatically when all required devices become available — on session unlock or physical console login.
 
+Device selections made via the tray menu are saved to `rust_aec.cfg` (next to the executable) and restored on the next launch.
+
 ### 4. Set the Virtual Mic in Your App
 
 In Discord, Zoom, Teams, OBS, or any app:
@@ -76,7 +78,7 @@ rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 
 ### Positional Arguments
 
-All positional arguments are optional. Each is a case-insensitive substring matched against the device's friendly name. If an argument is omitted or no matching device exists at startup, the app waits and retries on the next session unlock or console connect.
+All positional arguments are optional. Each is a case-insensitive substring matched against the device's friendly name. If an argument is omitted, the last saved choice from `rust_aec.cfg` is used (if the device is still present), then auto-detection, then wait.
 
 | Argument | Default | Example |
 |---|---|---|
@@ -110,7 +112,7 @@ The application runs in the Windows notification area (system tray). Right-click
 - **Start with Windows** — Toggle automatic startup (adds/removes a registry entry in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
 - **Exit** — Stop the AEC engine and quit
 
-Device changes take effect immediately — the audio pipeline restarts with the new device. Device lists are refreshed each time the menu is opened.
+Device changes take effect immediately — the audio pipeline restarts with the new device. Device lists are refreshed each time the menu is opened. **Selections are saved to `rust_aec.cfg`** next to the executable and restored on the next launch.
 
 ### Remote Desktop & Startup Behaviour
 
@@ -125,6 +127,7 @@ src/
   main.rs              # CLI parsing, device selection, tray + engine startup
   engine.rs            # AEC processing loop + audio thread management
   tray.rs              # Win32 system tray icon and context menus
+  config.rs            # Load/save device selections to rust_aec.cfg
   autostart.rs         # Windows registry autostart (HKCU Run key)
   audio/
     device.rs          # WASAPI device enumeration, cable filtering
@@ -165,6 +168,20 @@ Engine thread:     AEC processing loop (reads mic + reference, writes output)
 ```
 
 Commands flow from the tray to the engine via a crossbeam channel (`SetMicDevice`, `SetSpeakerDevice`, `SetOutputDevice`, `RefreshDevices`, `Shutdown`). Device changes trigger a full pipeline restart. `RefreshDevices` is sent automatically on Windows session unlock and console connect events (via `WTSRegisterSessionNotification`).
+
+## Config File
+
+Device selections are automatically saved to `rust_aec.cfg` in the same directory as the executable whenever you change a device from the tray menu. On the next launch the saved IDs are restored (if the devices are still present), falling back to auto-detection otherwise.
+
+```ini
+mic=<WASAPI endpoint ID>
+speaker=<WASAPI endpoint ID>
+output=<WASAPI endpoint ID>
+```
+
+Priority order: **CLI argument > saved config > auto-detect > wait**.
+
+You can delete `rust_aec.cfg` to reset all devices to auto-detect.
 
 ## Troubleshooting
 
