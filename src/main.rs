@@ -22,9 +22,40 @@ use crate::audio::device;
 use crate::engine::{AudioEngine, EngineCommand};
 use crate::tray::TrayState;
 
-fn main() -> Result<()> {
+fn main() {
     let verbose = std::env::args().any(|a| a == "--verbose" || a == "-v");
 
+    match run(verbose) {
+        Ok(()) => {}
+        Err(e) => {
+            let msg = format!("rust_aec error:\n{:#}", e);
+            if verbose {
+                eprintln!("{}", msg);
+            } else {
+                // Show a message box since the console may be gone.
+                show_error_box(&msg);
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+fn show_error_box(msg: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let wide_msg: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_title: Vec<u16> = "Rust AEC".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(wide_msg.as_ptr()),
+            PCWSTR(wide_title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+fn run(verbose: bool) -> Result<()> {
     // Hide the console window unless --verbose is passed.
     if !verbose {
         unsafe {
@@ -32,7 +63,16 @@ fn main() -> Result<()> {
         }
     }
 
-    device::com_init()?;
+    // Use STA COM on main thread (required for Win32 message pump / shell).
+    // Audio threads will init their own MTA COM.
+    unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        )
+        .ok()
+        .context("CoInitializeEx (STA)")?;
+    }
 
     // --- Device enumeration ---
     let capture_devices = device::list_capture_devices()?;
@@ -64,22 +104,34 @@ fn main() -> Result<()> {
     let output_query = positional.get(2).copied();
 
     // Select mic: user arg > default (if not a cable) > first real mic.
-    let mic_id = if let Some(q) = mic_query {
-        device::find_device_id_by_name(&capture_devices, q)
-            .context("Mic device not found")?
+    // Returns None when no mic is available (e.g. Remote Desktop with no audio).
+    let mic_id: Option<String> = if let Some(q) = mic_query {
+        Some(
+            device::find_device_id_by_name(&capture_devices, q)
+                .context("Mic device not found")?,
+        )
     } else {
-        let default_id = device::default_capture_device_id()?;
-        let default_name = device::device_name_by_id(&capture_devices, &default_id);
-        if device::is_virtual_cable(&default_name) {
-            if verbose {
-                println!(
-                    "Default capture device '{}' is a virtual cable, looking for a real mic...",
-                    default_name
-                );
+        match device::default_capture_device_id() {
+            Ok(default_id) => {
+                let default_name = device::device_name_by_id(&capture_devices, &default_id);
+                if device::is_virtual_cable(&default_name) {
+                    if verbose {
+                        println!(
+                            "Default capture device '{}' is a virtual cable, looking for a real mic...",
+                            default_name
+                        );
+                    }
+                    device::find_real_capture_device(&capture_devices).ok()
+                } else {
+                    Some(default_id)
+                }
             }
-            device::find_real_capture_device(&capture_devices)?
-        } else {
-            default_id
+            Err(_) => {
+                if verbose {
+                    println!("No capture device found, starting without microphone.");
+                }
+                None
+            }
         }
     };
 
@@ -108,10 +160,13 @@ fn main() -> Result<()> {
     };
 
     if verbose {
-        println!(
-            "Mic: {}",
-            device::device_name_by_id(&capture_devices, &mic_id)
-        );
+        match &mic_id {
+            Some(id) => println!(
+                "Mic: {}",
+                device::device_name_by_id(&capture_devices, id)
+            ),
+            None => println!("Mic: (none)"),
+        }
         println!(
             "Speaker: {}",
             device::device_name_by_id(&render_devices, &speaker_id)

@@ -7,6 +7,9 @@ use anyhow::Result;
 use crossbeam_channel::Sender;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
@@ -17,6 +20,9 @@ use crate::autostart;
 use crate::engine::EngineCommand;
 
 const WM_TRAYICON: u32 = WM_APP + 1;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_CONSOLE_CONNECT: u32 = 0x1;
+const WTS_SESSION_UNLOCK: u32 = 0x8;
 
 // Menu item ID ranges.
 const ID_MIC_BASE: u32 = 1000;
@@ -27,7 +33,7 @@ const ID_EXIT: u32 = 9999;
 pub struct TrayState {
     pub capture_devices: Vec<DeviceInfo>,
     pub render_devices: Vec<DeviceInfo>,
-    pub current_mic_id: String,
+    pub current_mic_id: Option<String>,
     pub current_speaker_id: String,
     pub current_output_id: String,
 }
@@ -82,11 +88,15 @@ pub fn run_tray(state: Arc<Mutex<TrayState>>, cmd_tx: Sender<EngineCommand>) -> 
         )?;
 
         // Load embedded icon (resource ID 1) or fall back to default.
-        let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-            .unwrap_or_default();
-        let hicon = LoadIconW(hinstance, PCWSTR(1 as *const u16)).unwrap_or_else(|_| {
-            LoadIconW(None, IDI_APPLICATION).unwrap()
-        });
+        let hicon = {
+            let hmodule = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                .unwrap_or_default();
+            // HMODULE and HINSTANCE are the same underlying type on Windows.
+            let hinstance = windows::Win32::Foundation::HINSTANCE(hmodule.0);
+            LoadIconW(hinstance, PCWSTR(1 as *const u16)).unwrap_or_else(|_| {
+                LoadIconW(None, IDI_APPLICATION).unwrap()
+            })
+        };
 
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -104,6 +114,9 @@ pub fn run_tray(state: Arc<Mutex<TrayState>>, cmd_tx: Sender<EngineCommand>) -> 
 
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 
+        // Register for session change notifications (unlock, console connect).
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -111,6 +124,7 @@ pub fn run_tray(state: Arc<Mutex<TrayState>>, cmd_tx: Sender<EngineCommand>) -> 
         }
 
         // Cleanup.
+        let _ = WTSUnRegisterSessionNotification(hwnd);
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         let ptr = TRAY_CTX.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !ptr.is_null() {
@@ -132,6 +146,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
             handle_menu_command(id);
+            LRESULT(0)
+        }
+        WM_WTSSESSION_CHANGE => {
+            let reason = wparam.0 as u32;
+            if reason == WTS_CONSOLE_CONNECT || reason == WTS_SESSION_UNLOCK {
+                if let Some(ctx) = get_ctx() {
+                    let _ = ctx.cmd_tx.send(EngineCommand::RefreshDevices);
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -169,7 +192,7 @@ unsafe fn handle_right_click(hwnd: HWND) {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
             fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE,
             fType: MFT_RADIOCHECK,
-            fState: if dev.id == st.current_mic_id {
+            fState: if Some(&dev.id) == st.current_mic_id.as_ref() {
                 MFS_CHECKED
             } else {
                 MFS_UNCHECKED
