@@ -25,6 +25,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
     "Win32_System_Console",
+    "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_RemoteDesktop",
