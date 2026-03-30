@@ -59,9 +59,12 @@ fn show_error_box(msg: &str) {
 }
 
 fn run(verbose: bool) -> Result<()> {
-    // Hide the console window unless --verbose is passed.
-    if !verbose {
-        unsafe {
+    unsafe {
+        if verbose {
+            // GUI subsystem apps have no console; allocate one for diagnostics.
+            let _ = windows::Win32::System::Console::AllocConsole();
+        } else {
+            // Free any console that may have been inherited (e.g. from a parent shell).
             let _ = windows::Win32::System::Console::FreeConsole();
         }
     }
