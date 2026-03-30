@@ -279,8 +279,6 @@ dependencies = [
 [[package]]
 name = "sonora-aec3"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65d8b7e53b058aa4631cf2a8f483bd7a0dec093aa413d21b44b86d5704deedeb"
 dependencies = [
  "sonora-common-audio",
  "sonora-fft",

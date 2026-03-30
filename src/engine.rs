@@ -1,7 +1,6 @@
 // Audio engine: manages AEC processing and audio threads.
 // Runs on its own thread; receives commands from the tray via crossbeam channel.
 
-use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -353,25 +352,7 @@ impl AudioEngine {
                 // through directly — skipping AEC saves significant CPU.
                 out_frame.copy_from_slice(&mic_frame);
             } else {
-                // Wrap in catch_unwind: the sonora AEC3 library has an off-by-one
-                // bug in its adaptive FIR filter that panics after ~6 minutes of
-                // continuous use. Without this, the panic kills the engine thread
-                // and audio stops permanently until the app is restarted.
-                if panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    proc.process_frame(&mic_frame, &ref_frame, &mut out_frame);
-                }))
-                .is_err()
-                {
-                    if self.verbose {
-                        eprintln!("[engine] AEC panic (sonora bug) — reinitializing processor.");
-                    }
-                    // Pass through mic audio for this frame so there is no gap.
-                    out_frame.copy_from_slice(&mic_frame);
-                    // Drop the corrupt AEC state and start fresh.
-                    if let Ok(new_proc) = AecProcessor::new() {
-                        *proc = new_proc;
-                    }
-                }
+                proc.process_frame(&mic_frame, &ref_frame, &mut out_frame);
             }
 
             p.out_prod.push(&out_frame);

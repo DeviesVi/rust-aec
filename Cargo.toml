@@ -31,3 +31,8 @@ features = [
 
 [build-dependencies]
 embed-resource = "3"
+
+[patch.crates-io]
+# Local fork of sonora-aec3 with the zero_filter off-by-one bug fixed.
+# See vendor/sonora-aec3/src/adaptive_fir_filter.rs (update_size fn).
+sonora-aec3 = { path = "vendor/sonora-aec3" }

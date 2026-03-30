@@ -145,6 +145,8 @@ resources/
   icon.svg             # Application icon (source SVG)
   app.ico              # Application icon (compiled from icon.svg)
   app.rc               # Windows resource script
+vendor/
+  sonora-aec3/         # Patched fork of sonora-aec3 (off-by-one fix in adaptive_fir_filter.rs)
 ```
 
 ## Technical Details
@@ -205,6 +207,3 @@ You can delete `rust_aec.cfg` to reset all devices to auto-detect.
 
 **Works via Remote Desktop but not physically (or vice versa)**
 - Lock and unlock the session — this triggers a device refresh and restarts the pipeline.
-
-**Echo cancellation stops for ~1 second every 6 minutes**
-- This is a known bug in the `sonora-aec3` library (v0.1.0). The app catches the internal panic, passes mic audio through unprocessed for that frame, and reinitialises the AEC processor automatically. No action needed.

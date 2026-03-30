@@ -35,6 +35,7 @@ Engine thread:     AEC processing loop (src/engine.rs)
 | `src/aec/mod.rs` | `AecProcessor` wrapping `sonora::AudioProcessing` |
 | `src/sync/mod.rs` | `AudioRingBuf` — SPSC ring buffer wrapper |
 | `build.rs` | Embeds `resources/app.ico` via `embed-resource` |
+| `vendor/sonora-aec3/` | Local fork of `sonora-aec3` (v0.1.0) with off-by-one fix in `adaptive_fir_filter.rs::update_size` |
 
 ## CLI Usage
 
@@ -65,17 +66,13 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 - All audio conversion handles both f32 and i16 PCM formats, with mono mixdown and naive linear resampling when device sample rate != 48kHz.
 - The `sonora` crate is the AEC engine (pure Rust WebRTC AEC3 port).
 - Loopback capture uses WASAPI's built-in loopback mode — no extra virtual device needed for capturing speaker output.
+- `vendor/sonora-aec3` is a local fork of `sonora-aec3` v0.1.0 pinned via `[patch.crates-io]` in `Cargo.toml`. The only change is a guard in `AdaptiveFirFilter::update_size()` (`adaptive_fir_filter.rs`) preventing `zero_filter` from being called with `old_size > new_size`, which caused a slice-index panic after ~37,000 frames (~6 minutes) of continuous AEC use. The upstream bug is a floating-point rounding issue in the partition-count interpolation that can produce a smaller `current_size_partitions` than `old_size` on a size-shrink step.
 
 ## Known Issues
 
-### sonora AEC3 panic after ~6 minutes
-
-The `sonora-aec3` crate (v0.1.0) has an off-by-one bug in `adaptive_fir_filter.rs:136` that panics after ~37,000 frames (~6 minutes). Without mitigation, the panic kills the engine thread and audio stops permanently.
-
-**Fix** (`src/engine.rs`): `process_frame` is wrapped in `std::panic::catch_unwind`. On panic, mic audio passes through for that frame and `AecProcessor` is reinitialized in place. The AEC re-adapts within ~1 second. This cycle repeats every ~6 minutes indefinitely.
+*(none)*
 
 ## Robustness
 
-- **AEC panic recovery**: `process_frame` is wrapped in `catch_unwind` to survive the sonora off-by-one panic (see [Known Issues](#known-issues)). On panic, mic audio passes through and the processor is reinitialized.
 - **AUDCLNT_BUFFERFLAGS_SILENT**: When WASAPI marks a capture buffer as silent (flag `0x2`), the buffer contents are undefined. Both `capture.rs` and `loopback.rs` push clean zeros instead.
 - **Gap-free render output**: The render thread always writes a full WASAPI buffer, zero-padding any shortfall from the ring buffer. Prevents audio discontinuities that apps may interpret as stream end.
