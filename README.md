@@ -1,5 +1,7 @@
 # rust_aec
 
+<img src="resources/icon.svg" width="80" align="right" alt="rust_aec icon">
+
 Real-time Acoustic Echo Cancellation for Windows. Removes speaker echo from your microphone and outputs clean audio to a virtual microphone that other apps (Discord, Zoom, Teams, OBS) can use.
 
 Runs as a **system tray application** with a notification area icon for device selection.
@@ -140,7 +142,8 @@ src/
     mod.rs             # Lock-free ring buffers for inter-thread audio
 build.rs               # Embeds app.ico via Windows resource compiler
 resources/
-  app.ico              # Application icon
+  icon.svg             # Application icon (source SVG)
+  app.ico              # Application icon (compiled from icon.svg)
   app.rc               # Windows resource script
 ```
 

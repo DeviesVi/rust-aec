@@ -31,6 +31,7 @@ const ID_SPEAKER_BASE: u32 = 1100;
 const ID_OUTPUT_BASE: u32 = 1200;
 const ID_AUTOSTART: u32 = 2000;
 const ID_VB_CABLE: u32 = 3000;
+const ID_GITHUB: u32 = 3001;
 const ID_EXIT: u32 = 9999;
 
 pub struct TrayState {
@@ -364,13 +365,38 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
         let _ = InsertMenuItemW(menu, 5, true, &mii);
     }
 
-    // Download VB-Audio Virtual Cable.
+    // Help submenu.
     {
-        let mut label = wide("Download VB-Audio Virtual Cable...");
+        let help_menu = CreatePopupMenu().unwrap();
+        {
+            let mut label = wide("Download VB-Audio Virtual Cable...");
+            let mii = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_STRING,
+                wID: ID_VB_CABLE,
+                dwTypeData: PWSTR(label.as_mut_ptr()),
+                cch: label.len() as u32 - 1,
+                ..Default::default()
+            };
+            let _ = InsertMenuItemW(help_menu, 0, true, &mii);
+        }
+        {
+            let mut label = wide("GitHub");
+            let mii = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_STRING,
+                wID: ID_GITHUB,
+                dwTypeData: PWSTR(label.as_mut_ptr()),
+                cch: label.len() as u32 - 1,
+                ..Default::default()
+            };
+            let _ = InsertMenuItemW(help_menu, 1, true, &mii);
+        }
+        let mut label = wide("Help");
         let mii = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_ID | MIIM_STRING,
-            wID: ID_VB_CABLE,
+            fMask: MIIM_STRING | MIIM_SUBMENU,
+            hSubMenu: help_menu,
             dwTypeData: PWSTR(label.as_mut_ptr()),
             cch: label.len() as u32 - 1,
             ..Default::default()
@@ -443,6 +469,17 @@ unsafe fn handle_menu_command(id: u32) { unsafe {
         }
     } else if id == ID_VB_CABLE {
         let url = wide("https://vb-audio.com/Cable/");
+        let op = wide("open");
+        windows::Win32::UI::Shell::ShellExecuteW(
+            HWND::default(),
+            PCWSTR(op.as_ptr()),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    } else if id == ID_GITHUB {
+        let url = wide("https://github.com/DeviesVi/rust_aec");
         let op = wide("open");
         windows::Win32::UI::Shell::ShellExecuteW(
             HWND::default(),
