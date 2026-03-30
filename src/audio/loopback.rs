@@ -69,12 +69,16 @@ pub fn loopback_loop(
 
                 let frames = num_frames as usize;
 
-                // AUDCLNT_BUFFERFLAGS_SILENT (0x2): buffer content is undefined.
-                let samples = if flags & 0x2 != 0 {
-                    vec![0.0f32; frames]
-                } else {
-                    convert_to_f32_mono(buffer, frames, device_channels, bits)
-                };
+                // AUDCLNT_BUFFERFLAGS_SILENT (0x2): no real audio playing.
+                // Skip conversion/resampling/push so the engine sees an empty
+                // ref buffer and can bypass AEC entirely.
+                if flags & 0x2 != 0 {
+                    capture_client.ReleaseBuffer(num_frames)?;
+                    packet_size = capture_client.GetNextPacketSize()?;
+                    continue;
+                }
+
+                let samples = convert_to_f32_mono(buffer, frames, device_channels, bits);
 
                 let samples = if device_rate != SAMPLE_RATE {
                     simple_resample(&samples, device_rate, SAMPLE_RATE)
