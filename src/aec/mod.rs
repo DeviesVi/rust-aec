@@ -13,7 +13,6 @@ pub const SAMPLE_RATE: usize = 48_000;
 
 pub struct AecProcessor {
     apm: AudioProcessing,
-    render_buf: Vec<f32>,
 }
 
 impl AecProcessor {
@@ -28,7 +27,7 @@ impl AecProcessor {
             .capture_config(stream_config)
             .render_config(stream_config)
             .build();
-        Ok(Self { apm, render_buf: vec![0.0f32; FRAME_SIZE] })
+        Ok(Self { apm })
     }
 
     /// Process one 10ms frame.
@@ -36,10 +35,10 @@ impl AecProcessor {
     /// Returns processed (echo-cancelled) samples.
     pub fn process_frame(&mut self, mic_frame: &[f32], ref_frame: &[f32], out: &mut [f32]) {
         // Feed far-end (speaker/reference) signal.
-        self.render_buf.fill(0.0);
+        let mut render_out = vec![0.0f32; FRAME_SIZE];
         if let Err(e) = self.apm.process_render_f32(
             &[ref_frame],
-            &mut [&mut self.render_buf],
+            &mut [&mut render_out],
         ) {
             eprintln!("[aec] process_render error: {e}");
         }

@@ -46,10 +46,10 @@ cargo build --release
 ### 3. Run
 
 ```sh
-# Normal mode — runs as a tray icon, no console output
+# Normal mode — runs as a tray icon, no console window
 cargo run --release
 
-# Verbose mode — shows console with diagnostic output
+# Verbose mode — prints diagnostics to the terminal you run it from
 cargo run --release -- --verbose
 ```
 
@@ -76,7 +76,7 @@ rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 
 | Flag | Description |
 |---|---|
-| `--verbose`, `-v` | Show console window with diagnostic output (device lists, buffer levels, peak levels every 2s) |
+| `--verbose`, `-v` | Attach to the parent terminal for diagnostic output (device lists, buffer levels, peak levels every 2s). Falls back to a new console window if not run from a terminal. |
 
 ### Positional Arguments
 

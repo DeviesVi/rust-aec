@@ -41,7 +41,7 @@ struct Pipeline {
 
 impl Pipeline {
     fn new(mic_id: &str, speaker_id: &str, output_id: &str) -> Result<Self> {
-        let buf_capacity = SAMPLE_RATE / 2; // 500ms — headroom for scheduling jitter
+        let buf_capacity = SAMPLE_RATE / 5; // 200ms
         let mic_ring = AudioRingBuf::new(buf_capacity);
         let ref_ring = AudioRingBuf::new(buf_capacity);
         let out_ring = AudioRingBuf::new(buf_capacity);
@@ -345,14 +345,6 @@ impl AudioEngine {
             let ref_available = p.ref_cons.available().min(FRAME_SIZE);
             p.ref_cons.pop(&mut ref_frame[..ref_available]);
             ref_frame[ref_available..].fill(0.0);
-
-            // Drain excess reference data caused by mic/speaker clock drift.
-            // Without this, the reference delay grows unboundedly and the AEC
-            // eventually fails to find the echo, causing voice suppression.
-            let ref_backlog = p.ref_cons.available();
-            if ref_backlog > FRAME_SIZE * 4 {
-                p.ref_cons.skip(ref_backlog - FRAME_SIZE);
-            }
 
             // Wrap in catch_unwind: the sonora AEC3 library has an off-by-one
             // bug in its adaptive FIR filter that panics after ~6 minutes of

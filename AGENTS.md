@@ -16,7 +16,7 @@ Engine thread:     AEC processing loop (src/engine.rs)
 
 - **Main thread**: Runs Win32 message pump for the system tray icon. Sends `EngineCommand` to the engine thread via `crossbeam-channel`.
 - **Engine thread**: Owns the AEC processor + 3 audio threads + ring buffers. Handles device hot-swap by rebuilding the full pipeline.
-- **Inter-thread comms**: Lock-free SPSC ring buffers (`ringbuf` crate), 500ms capacity. Commands via `crossbeam-channel`.
+- **Inter-thread comms**: Lock-free SPSC ring buffers (`ringbuf` crate), 200ms capacity. Commands via `crossbeam-channel`.
 - **Processing**: 10ms frames (480 samples @ 48kHz). AEC via `sonora` (pure-Rust WebRTC AEC3 port).
 - **Audio API**: WASAPI directly via the `windows` crate (v0.58). Windows-only.
 
@@ -42,7 +42,7 @@ Engine thread:     AEC processing loop (src/engine.rs)
 rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 ```
 
-- `--verbose` / `-v`: Show console with diagnostics. Without this, the console is hidden (FreeConsole).
+- `--verbose` / `-v`: Attach to the parent terminal (or open a new console) for diagnostic output.
 - All positional arguments are optional substring matches (case-insensitive).
 - **mic_name**: Microphone device. Default: first real (non-virtual-cable) capture device.
 - **speaker_name**: Speaker for loopback. Default: Windows default render device.
@@ -54,6 +54,7 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 
 ## Key Design Decisions
 
+- **GUI subsystem (`#![windows_subsystem = "windows"]`)**: No console window on startup. With `--verbose`, attaches to the parent terminal via `AttachConsole` + `CONOUT$` redirect, falling back to `AllocConsole` if not run from a terminal.
 - **No tray crate**: Uses Win32 API directly (Shell_NotifyIconW, CreatePopupMenu, etc.) via the `windows` crate to avoid extra dependencies.
 - **Cable filtering**: When auto-selecting a microphone, devices with "cable" in the name are skipped to avoid selecting a virtual cable as input.
 - **Device hot-swap**: When the user changes a device via the tray menu, the entire audio pipeline is torn down and rebuilt. The AEC re-adapts in ~1-2 seconds.
@@ -65,35 +66,16 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 - The `sonora` crate is the AEC engine (pure Rust WebRTC AEC3 port).
 - Loopback capture uses WASAPI's built-in loopback mode — no extra virtual device needed for capturing speaker output.
 
-## Open / Unresolved Issues
+## Known Issues
 
-### Voice output dies after ~6 minutes — **RESOLVED**
+### sonora AEC3 panic after ~6 minutes
 
-**Root cause**: The `sonora-aec3` crate (v0.1.0) has a bug in `adaptive_fir_filter.rs:136` — an off-by-one slice index panic that fires after ~37,000 processed frames (~6 minutes at 10ms/frame). The engine thread panicked, killing all audio processing permanently.
+The `sonora-aec3` crate (v0.1.0) has an off-by-one bug in `adaptive_fir_filter.rs:136` that panics after ~37,000 frames (~6 minutes). Without mitigation, the panic kills the engine thread and audio stops permanently.
 
-**Observed diagnostic signature just before crash**:
-```
-[diag] frames=37315, mic_peak=0.0651, out_peak=0.0031, mic_buf=0, ref_buf=1440, out_buf=960
-thread 'aec-engine' panicked at adaptive_fir_filter.rs:136:22:
-slice index starts at 13 but ends at 12
-```
+**Fix** (`src/engine.rs`): `process_frame` is wrapped in `std::panic::catch_unwind`. On panic, mic audio passes through for that frame and `AecProcessor` is reinitialized in place. The AEC re-adapts within ~1 second. This cycle repeats every ~6 minutes indefinitely.
 
-**Fix** (`src/engine.rs`): Wrapped `proc.process_frame(...)` in `std::panic::catch_unwind`. On panic: pass through raw mic audio for that frame (no audible gap), reinitialize the `AecProcessor` in place, and continue. The AEC re-adapts within ~1 second.
+## Robustness
 
-**Previously ruled-out theories** (all wrong):
-1. AEC over-suppression (sonora config has no suppression knobs)
-2. Audio thread death from WASAPI errors
-3. Output ring buffer clock drift
-
-## Robustness / Glitch Prevention
-
-These defenses keep the audio pipeline stable over long sessions and across different apps (QQ, Discord, Zoom, etc.):
-
-- **AEC panic recovery**: The `sonora-aec3` crate (v0.1.0) has a known off-by-one panic in its adaptive FIR filter after ~6 minutes. `process_frame` is wrapped in `std::panic::catch_unwind`; on panic, mic audio is passed through for that frame and the `AecProcessor` is reinitialized in place.
-- **AUDCLNT_BUFFERFLAGS_SILENT handling**: When WASAPI marks a capture buffer as silent, the buffer contents are *undefined*. Both `capture.rs` and `loopback.rs` detect flag `0x2` and push clean zeros instead. Without this, garbage reference data causes the AEC to diverge and suppress real voice.
-- **Gap-free render output**: The render thread always writes a full WASAPI buffer, zero-padding any shortfall from the ring buffer. Prevents audio discontinuities that voice chat apps (QQ, etc.) interpret as stream end.
-- **Reference clock drift drain**: Mic and speaker devices may run on different hardware clocks (up to ~0.1% drift). The engine drains excess reference data when the ref ring buffer exceeds 4 frames (~40ms), keeping the AEC delay bounded so echo cancellation stays aligned.
-- **NaN/Inf sanitization**: Both capture threads replace any non-finite samples (from buggy audio drivers) with 0.0 before pushing to ring buffers. Prevents permanent AEC divergence.
-- **Ring buffer capacity (500ms)**: Provides headroom for OS scheduling jitter and burst processing without overflow.
-- **Output clamping**: f32 render output is clamped to [-1.0, 1.0] to prevent out-of-range values from reaching the virtual cable consumer.
-- **Pre-allocated AEC render buffer**: The `AecProcessor` reuses a fixed buffer for `process_render_f32` to avoid per-frame heap allocation.
+- **AEC panic recovery**: `process_frame` is wrapped in `catch_unwind` to survive the sonora off-by-one panic. On panic, mic audio passes through and the processor is reinitialized.
+- **AUDCLNT_BUFFERFLAGS_SILENT**: When WASAPI marks a capture buffer as silent (flag `0x2`), the buffer contents are undefined. Both `capture.rs` and `loopback.rs` push clean zeros instead.
+- **Gap-free render output**: The render thread always writes a full WASAPI buffer, zero-padding any shortfall from the ring buffer. Prevents audio discontinuities that apps may interpret as stream end.

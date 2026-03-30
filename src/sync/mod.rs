@@ -63,11 +63,6 @@ impl AudioConsumer {
     pub fn available(&self) -> usize {
         self.inner.occupied_len()
     }
-
-    /// Discard up to `count` samples without reading them. Returns actual skipped.
-    pub fn skip(&mut self, count: usize) -> usize {
-        self.inner.skip(count)
-    }
 }
 
 // SAFETY: The ring buffer consumer is only used from one thread.
