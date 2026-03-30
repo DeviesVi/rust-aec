@@ -132,7 +132,11 @@ pub(crate) fn apply_filter(
 // ---------------------------------------------------------------------------
 
 /// Clears filter partitions in range [old_size, new_size).
+/// No-op when old_size >= new_size (filter shrinking, nothing to zero).
 fn zero_filter(old_size: usize, new_size: usize, h: &mut [Vec<FftData>]) {
+    if old_size >= new_size {
+        return;
+    }
     for h_p in &mut h[old_size..new_size] {
         for ch_data in h_p {
             ch_data.clear();
@@ -335,12 +339,7 @@ impl AdaptiveFirFilter {
             self.current_size_partitions = self.target_size_partitions;
             self.old_target_size_partitions = self.target_size_partitions;
         }
-        // Guard against size shrinks: when current_size_partitions < old_size
-        // the slice h[old_size..new_size] would be invalid and panic.
-        // This happens due to floating-point rounding in the interpolation above.
-        if old_size < self.current_size_partitions {
-            zero_filter(old_size, self.current_size_partitions, &mut self.h);
-        }
+        zero_filter(old_size, self.current_size_partitions, &mut self.h);
     }
 
     fn constrain(&mut self) {
