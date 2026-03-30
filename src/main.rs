@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 // Rust AEC Virtual Microphone
 //
 // Captures microphone audio (WASAPI), captures speaker loopback (WASAPI),
