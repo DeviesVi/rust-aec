@@ -66,7 +66,13 @@ pub fn capture_loop(
                 )?;
 
                 let frames = num_frames as usize;
-                let samples = convert_to_f32_mono(buffer, frames, device_channels, bits);
+
+                // AUDCLNT_BUFFERFLAGS_SILENT (0x2): buffer content is undefined.
+                let samples = if flags & 0x2 != 0 {
+                    vec![0.0f32; frames]
+                } else {
+                    convert_to_f32_mono(buffer, frames, device_channels, bits)
+                };
 
                 let samples = if device_rate != SAMPLE_RATE {
                     simple_resample(&samples, device_rate, SAMPLE_RATE)

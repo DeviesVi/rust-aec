@@ -75,16 +75,8 @@ pub fn render_loop(
             };
 
             let mut mono_buf = vec![0.0f32; mono_frames_needed];
-            let read = consumer.pop(&mut mono_buf);
-
-            // If no data, write silence to keep the WASAPI stream alive.
-            if read == 0 {
-                let buffer = render_client.GetBuffer(available_frames as u32)?;
-                std::ptr::write_bytes(buffer, 0u8, available_frames * device_channels * (bits as usize / 8));
-                render_client.ReleaseBuffer(available_frames as u32, 0)?;
-                continue;
-            }
-            mono_buf.truncate(read);
+            consumer.pop(&mut mono_buf);
+            // Unread portion stays zero (silence), ensuring gap-free output.
 
             // Resample if needed.
             let mono_buf = if device_rate != SAMPLE_RATE {
