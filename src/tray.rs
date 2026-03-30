@@ -30,6 +30,7 @@ const ID_MIC_BASE: u32 = 1000;
 const ID_SPEAKER_BASE: u32 = 1100;
 const ID_OUTPUT_BASE: u32 = 1200;
 const ID_AUTOSTART: u32 = 2000;
+const ID_VB_CABLE: u32 = 3000;
 const ID_EXIT: u32 = 9999;
 
 pub struct TrayState {
@@ -363,6 +364,20 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
         let _ = InsertMenuItemW(menu, 5, true, &mii);
     }
 
+    // Download VB-Audio Virtual Cable.
+    {
+        let mut label = wide("Download VB-Audio Virtual Cable...");
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_ID | MIIM_STRING,
+            wID: ID_VB_CABLE,
+            dwTypeData: PWSTR(label.as_mut_ptr()),
+            cch: label.len() as u32 - 1,
+            ..Default::default()
+        };
+        let _ = InsertMenuItemW(menu, 6, true, &mii);
+    }
+
     // Exit.
     {
         let mut label = wide("Exit");
@@ -374,7 +389,7 @@ unsafe fn handle_right_click(hwnd: HWND) { unsafe {
             cch: label.len() as u32 - 1,
             ..Default::default()
         };
-        let _ = InsertMenuItemW(menu, 6, true, &mii);
+        let _ = InsertMenuItemW(menu, 7, true, &mii);
     }
 
     drop(st);
@@ -426,6 +441,17 @@ unsafe fn handle_menu_command(id: u32) { unsafe {
         } else {
             let _ = autostart::enable_autostart();
         }
+    } else if id == ID_VB_CABLE {
+        let url = wide("https://vb-audio.com/Cable/");
+        let op = wide("open");
+        windows::Win32::UI::Shell::ShellExecuteW(
+            HWND::default(),
+            PCWSTR(op.as_ptr()),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
     } else if id == ID_EXIT {
         let _ = ctx.cmd_tx.send(EngineCommand::Shutdown);
         PostQuitMessage(0);
