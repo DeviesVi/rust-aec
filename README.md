@@ -49,7 +49,7 @@ cargo build --release
 # Normal mode — runs as a tray icon, no console window
 cargo run --release
 
-# Verbose mode — prints diagnostics to the terminal you run it from
+# Verbose mode — opens a dedicated console window with diagnostics
 cargo run --release -- --verbose
 ```
 
@@ -76,7 +76,7 @@ rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 
 | Flag | Description |
 |---|---|
-| `--verbose`, `-v` | Attach to the parent terminal for diagnostic output (device lists, buffer levels, peak levels every 2s). Falls back to a new console window if not run from a terminal. |
+| `--verbose`, `-v` | Open a dedicated console window for diagnostic output (device lists, buffer levels, peak levels every 2s). Ctrl+C in that window exits the app. |
 
 ### Positional Arguments
 
@@ -205,3 +205,6 @@ You can delete `rust_aec.cfg` to reset all devices to auto-detect.
 
 **Works via Remote Desktop but not physically (or vice versa)**
 - Lock and unlock the session — this triggers a device refresh and restarts the pipeline.
+
+**Echo cancellation stops for ~1 second every 6 minutes**
+- This is a known bug in the `sonora-aec3` library (v0.1.0). The app catches the internal panic, passes mic audio through unprocessed for that frame, and reinitialises the AEC processor automatically. No action needed.

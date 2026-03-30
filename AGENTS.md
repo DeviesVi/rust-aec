@@ -42,7 +42,7 @@ Engine thread:     AEC processing loop (src/engine.rs)
 rust_aec.exe [--verbose] [mic_name] [speaker_name] [output_name]
 ```
 
-- `--verbose` / `-v`: Attach to the parent terminal (or open a new console) for diagnostic output.
+- `--verbose` / `-v`: Open a dedicated console window for diagnostic output (device lists, buffer levels, peak levels every 2s). Ctrl+C in that window exits the app.
 - All positional arguments are optional substring matches (case-insensitive).
 - **mic_name**: Microphone device. Default: first real (non-virtual-cable) capture device.
 - **speaker_name**: Speaker for loopback. Default: Windows default render device.
@@ -54,7 +54,7 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 
 ## Key Design Decisions
 
-- **GUI subsystem (`#![windows_subsystem = "windows"]`)**: No console window on startup. With `--verbose`, attaches to the parent terminal via `AttachConsole` + `CONOUT$` redirect, falling back to `AllocConsole` if not run from a terminal.
+- **GUI subsystem (`#![windows_subsystem = "windows"]`)**: No console window on startup. With `--verbose`, allocates a dedicated console window via `AllocConsole()`. This gives reliable Ctrl+C support. Note: `AttachConsole(ATTACH_PARENT_PROCESS)` was attempted but GUI subsystem processes do not receive `CTRL_C_EVENT` even after attaching, so a dedicated window is the only reliable approach.
 - **No tray crate**: Uses Win32 API directly (Shell_NotifyIconW, CreatePopupMenu, etc.) via the `windows` crate to avoid extra dependencies.
 - **Cable filtering**: When auto-selecting a microphone, devices with "cable" in the name are skipped to avoid selecting a virtual cable as input.
 - **Device hot-swap**: When the user changes a device via the tray menu, the entire audio pipeline is torn down and rebuilt. The AEC re-adapts in ~1-2 seconds.
@@ -76,6 +76,6 @@ The `sonora-aec3` crate (v0.1.0) has an off-by-one bug in `adaptive_fir_filter.r
 
 ## Robustness
 
-- **AEC panic recovery**: `process_frame` is wrapped in `catch_unwind` to survive the sonora off-by-one panic. On panic, mic audio passes through and the processor is reinitialized.
+- **AEC panic recovery**: `process_frame` is wrapped in `catch_unwind` to survive the sonora off-by-one panic (see [Known Issues](#known-issues)). On panic, mic audio passes through and the processor is reinitialized.
 - **AUDCLNT_BUFFERFLAGS_SILENT**: When WASAPI marks a capture buffer as silent (flag `0x2`), the buffer contents are undefined. Both `capture.rs` and `loopback.rs` push clean zeros instead.
 - **Gap-free render output**: The render thread always writes a full WASAPI buffer, zero-padding any shortfall from the ring buffer. Prevents audio discontinuities that apps may interpret as stream end.

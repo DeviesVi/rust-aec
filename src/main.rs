@@ -61,34 +61,9 @@ fn show_error_box(msg: &str) {
 fn run(verbose: bool) -> Result<()> {
     unsafe {
         if verbose {
-            use windows::core::PCWSTR;
-            use windows::Win32::Storage::FileSystem::{
-                CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_WRITE, OPEN_EXISTING,
-            };
-            use windows::Win32::System::Console::{
-                AllocConsole, AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS,
-                STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-            };
-            // Attach to the terminal that launched us; fall back to a new window.
-            if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-                let _ = AllocConsole();
-            }
-            // GUI subsystem apps don't inherit console handles, so stdout/stderr
-            // are null even after AttachConsole. Open CONOUT$ explicitly and
-            // redirect both handles so println!/eprintln! write to the terminal.
-            let conout: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
-            if let Ok(h) = CreateFileW(
-                PCWSTR(conout.as_ptr()),
-                0x4000_0000u32, // GENERIC_WRITE
-                FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            ) {
-                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
-            }
+            // Allocate a dedicated console window for diagnostics.
+            // Closing this window (or pressing Ctrl+C in it) exits the app.
+            let _ = windows::Win32::System::Console::AllocConsole();
         } else {
             // Free any console inherited from a parent shell.
             let _ = windows::Win32::System::Console::FreeConsole();
@@ -278,15 +253,6 @@ fn run(verbose: bool) -> Result<()> {
     }));
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EngineCommand>();
-
-    // --- Ctrl+C handler ---
-    {
-        let cmd_tx = cmd_tx.clone();
-        ctrlc::set_handler(move || {
-            let _ = cmd_tx.send(EngineCommand::Shutdown);
-        })
-        .ok();
-    }
 
     // --- Spawn engine thread ---
     let engine_state = state.clone();
