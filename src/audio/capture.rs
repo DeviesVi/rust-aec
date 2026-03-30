@@ -74,11 +74,16 @@ pub fn capture_loop(
                     convert_to_f32_mono(buffer, frames, device_channels, bits)
                 };
 
-                let samples = if device_rate != SAMPLE_RATE {
+                let mut samples = if device_rate != SAMPLE_RATE {
                     simple_resample(&samples, device_rate, SAMPLE_RATE)
                 } else {
                     samples
                 };
+
+                // Guard against NaN/Inf from buggy drivers — protect AEC convergence.
+                for s in &mut samples {
+                    if !s.is_finite() { *s = 0.0; }
+                }
 
                 producer.push(&samples);
 

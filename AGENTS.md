@@ -16,7 +16,7 @@ Engine thread:     AEC processing loop (src/engine.rs)
 
 - **Main thread**: Runs Win32 message pump for the system tray icon. Sends `EngineCommand` to the engine thread via `crossbeam-channel`.
 - **Engine thread**: Owns the AEC processor + 3 audio threads + ring buffers. Handles device hot-swap by rebuilding the full pipeline.
-- **Inter-thread comms**: Lock-free SPSC ring buffers (`ringbuf` crate), 200ms capacity. Commands via `crossbeam-channel`.
+- **Inter-thread comms**: Lock-free SPSC ring buffers (`ringbuf` crate), 500ms capacity. Commands via `crossbeam-channel`.
 - **Processing**: 10ms frames (480 samples @ 48kHz). AEC via `sonora` (pure-Rust WebRTC AEC3 port).
 - **Audio API**: WASAPI directly via the `windows` crate (v0.58). Windows-only.
 
@@ -64,3 +64,15 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 - All audio conversion handles both f32 and i16 PCM formats, with mono mixdown and naive linear resampling when device sample rate != 48kHz.
 - The `sonora` crate is the AEC engine (pure Rust WebRTC AEC3 port).
 - Loopback capture uses WASAPI's built-in loopback mode — no extra virtual device needed for capturing speaker output.
+
+## Robustness / Glitch Prevention
+
+These defenses keep the audio pipeline stable over long sessions and across different apps (QQ, Discord, Zoom, etc.):
+
+- **AUDCLNT_BUFFERFLAGS_SILENT handling**: When WASAPI marks a capture buffer as silent, the buffer contents are *undefined*. Both `capture.rs` and `loopback.rs` detect flag `0x2` and push clean zeros instead. Without this, garbage reference data causes the AEC to diverge and suppress real voice.
+- **Gap-free render output**: The render thread always writes a full WASAPI buffer, zero-padding any shortfall from the ring buffer. Prevents audio discontinuities that voice chat apps (QQ, etc.) interpret as stream end.
+- **Reference clock drift drain**: Mic and speaker devices may run on different hardware clocks (up to ~0.1% drift). The engine drains excess reference data when the ref ring buffer exceeds 4 frames (~40ms), keeping the AEC delay bounded so echo cancellation stays aligned.
+- **NaN/Inf sanitization**: Both capture threads replace any non-finite samples (from buggy audio drivers) with 0.0 before pushing to ring buffers. Prevents permanent AEC divergence.
+- **Ring buffer capacity (500ms)**: Provides headroom for OS scheduling jitter and burst processing without overflow.
+- **Output clamping**: f32 render output is clamped to [-1.0, 1.0] to prevent out-of-range values from reaching the virtual cable consumer.
+- **Pre-allocated AEC render buffer**: The `AecProcessor` reuses a fixed buffer for `process_render_f32` to avoid per-frame heap allocation.

@@ -117,8 +117,9 @@ unsafe fn write_to_device_buffer(
             let data =
                 std::slice::from_raw_parts_mut(buffer as *mut f32, mono.len() * channels);
             for (i, &sample) in mono.iter().enumerate() {
+                let s = sample.clamp(-1.0, 1.0);
                 for ch in 0..channels {
-                    data[i * channels + ch] = sample;
+                    data[i * channels + ch] = s;
                 }
             }
         }
