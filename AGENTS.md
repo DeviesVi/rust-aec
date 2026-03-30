@@ -65,10 +65,31 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 - The `sonora` crate is the AEC engine (pure Rust WebRTC AEC3 port).
 - Loopback capture uses WASAPI's built-in loopback mode — no extra virtual device needed for capturing speaker output.
 
+## Open / Unresolved Issues
+
+### Voice output dies after ~6 minutes — **RESOLVED**
+
+**Root cause**: The `sonora-aec3` crate (v0.1.0) has a bug in `adaptive_fir_filter.rs:136` — an off-by-one slice index panic that fires after ~37,000 processed frames (~6 minutes at 10ms/frame). The engine thread panicked, killing all audio processing permanently.
+
+**Observed diagnostic signature just before crash**:
+```
+[diag] frames=37315, mic_peak=0.0651, out_peak=0.0031, mic_buf=0, ref_buf=1440, out_buf=960
+thread 'aec-engine' panicked at adaptive_fir_filter.rs:136:22:
+slice index starts at 13 but ends at 12
+```
+
+**Fix** (`src/engine.rs`): Wrapped `proc.process_frame(...)` in `std::panic::catch_unwind`. On panic: pass through raw mic audio for that frame (no audible gap), reinitialize the `AecProcessor` in place, and continue. The AEC re-adapts within ~1 second.
+
+**Previously ruled-out theories** (all wrong):
+1. AEC over-suppression (sonora config has no suppression knobs)
+2. Audio thread death from WASAPI errors
+3. Output ring buffer clock drift
+
 ## Robustness / Glitch Prevention
 
 These defenses keep the audio pipeline stable over long sessions and across different apps (QQ, Discord, Zoom, etc.):
 
+- **AEC panic recovery**: The `sonora-aec3` crate (v0.1.0) has a known off-by-one panic in its adaptive FIR filter after ~6 minutes. `process_frame` is wrapped in `std::panic::catch_unwind`; on panic, mic audio is passed through for that frame and the `AecProcessor` is reinitialized in place.
 - **AUDCLNT_BUFFERFLAGS_SILENT handling**: When WASAPI marks a capture buffer as silent, the buffer contents are *undefined*. Both `capture.rs` and `loopback.rs` detect flag `0x2` and push clean zeros instead. Without this, garbage reference data causes the AEC to diverge and suppress real voice.
 - **Gap-free render output**: The render thread always writes a full WASAPI buffer, zero-padding any shortfall from the ring buffer. Prevents audio discontinuities that voice chat apps (QQ, etc.) interpret as stream end.
 - **Reference clock drift drain**: Mic and speaker devices may run on different hardware clocks (up to ~0.1% drift). The engine drains excess reference data when the ref ring buffer exceeds 4 frames (~40ms), keeping the AEC delay bounded so echo cancellation stays aligned.
