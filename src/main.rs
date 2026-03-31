@@ -31,7 +31,7 @@ fn main() {
     match run(verbose) {
         Ok(()) => {}
         Err(e) => {
-            let msg = format!("rust_aec error:\n{:#}", e);
+            let msg = format!("rust-aec error:\n{:#}", e);
             if verbose {
                 eprintln!("{}", msg);
             } else {

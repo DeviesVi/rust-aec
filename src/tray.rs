@@ -479,7 +479,7 @@ unsafe fn handle_menu_command(id: u32) { unsafe {
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
     } else if id == ID_GITHUB {
-        let url = wide("https://github.com/DeviesVi/rust_aec");
+        let url = wide("https://github.com/DeviesVi/rust-aec");
         let op = wide("open");
         windows::Win32::UI::Shell::ShellExecuteW(
             HWND::default(),

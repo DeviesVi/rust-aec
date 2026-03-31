@@ -12,7 +12,7 @@ pub struct Config {
 
 fn config_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join("rust_aec.cfg"))
+    Some(exe.parent()?.join("rust-aec.cfg"))
 }
 
 pub fn load() -> Config {

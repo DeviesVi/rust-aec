@@ -201,8 +201,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_aec"
-version = "0.2.0"
+name = "rust-aec"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
