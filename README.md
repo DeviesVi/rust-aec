@@ -133,9 +133,10 @@ src/
   autostart.rs         # Windows registry autostart (HKCU Run key)
   audio/
     device.rs          # WASAPI device enumeration, cable filtering
-    capture.rs         # Microphone capture thread
+    capture.rs         # Microphone capture thread (on-demand)
     loopback.rs        # Speaker loopback capture thread
     render.rs          # Clean audio output thread (writes to virtual cable)
+    session_monitor.rs # WASAPI session callbacks → Resume/Pause mic on demand
   aec/
     mod.rs             # AEC processor (sonora WebRTC AEC3)
   sync/
@@ -166,17 +167,6 @@ vendor/
 
 ```
 Main thread:       Win32 message pump + system tray icon
-Session monitor:   WASAPI callbacks → Resume/Pause (mic indicator off when idle)
-Engine thread:     AEC processing loop
-  loopback:        WASAPI loopback → ref ring buffer        ← always running
-  render:          out ring buffer → WASAPI virtual cable   ← always running
-  mic-capture:     WASAPI capture → mic ring buffer         ← on demand only
-```
-
-### Architecture
-
-```
-Main thread:       Win32 message pump + system tray icon
 Session monitor:   WASAPI session callbacks → Resume/Pause engine
 Engine thread:     AEC processing loop
   WarmPipeline (always running):
@@ -188,7 +178,7 @@ Engine thread:     AEC processing loop
 
 Commands flow from the tray to the engine via a crossbeam channel (`SetMicDevice`, `SetSpeakerDevice`, `SetOutputDevice`, `RefreshDevices`, `Shutdown`). Device changes trigger a full pipeline restart. `RefreshDevices` is sent automatically on Windows session unlock and console connect events (via `WTSRegisterSessionNotification`).
 
-The session monitor registers `IAudioSessionNotification` callbacks on all capture devices at startup. When any external program opens CABLE Output for recording, the callback fires instantly (~0 ms), the engine opens the real microphone and starts AEC. When all recording sessions end, the engine releases the microphone — the mic-in-use indicator turns off. The loopback and render threads remain running throughout so there is no audio gap when recording resumes.
+The session monitor resolves the `PKEY_Device_ContainerId` of the configured output device (CABLE Input) at startup — a GUID shared by all endpoints of the same virtual audio device. It registers `IAudioSessionNotification` only on the matching capture endpoint (CABLE Output), ignoring all unrelated microphones and webcams. When any external program opens CABLE Output for recording, the callback fires instantly (~0 ms), the engine opens the real microphone and starts AEC. When all recording sessions end, the engine releases the microphone — the mic-in-use indicator turns off. The loopback and render threads remain running throughout so there is no audio gap when recording resumes.
 
 ## Config File
 
