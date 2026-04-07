@@ -58,7 +58,7 @@ pub fn render_loop(
         );
 
         while !stop.load(Ordering::Relaxed) {
-            let _ = WaitForSingleObject(event, 100);
+            let _ = WaitForSingleObject(event, 20);
 
             let padding = audio_client.GetCurrentPadding()?;
             let available_frames = (buffer_size - padding) as usize;

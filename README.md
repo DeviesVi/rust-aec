@@ -166,13 +166,29 @@ vendor/
 
 ```
 Main thread:       Win32 message pump + system tray icon
-Engine thread:     AEC processing loop (reads mic + reference, writes output)
-  mic-capture:     WASAPI capture → mic ring buffer
-  loopback:        WASAPI loopback → ref ring buffer
-  render:          out ring buffer → WASAPI virtual cable
+Session monitor:   WASAPI callbacks → Resume/Pause (mic indicator off when idle)
+Engine thread:     AEC processing loop
+  loopback:        WASAPI loopback → ref ring buffer        ← always running
+  render:          out ring buffer → WASAPI virtual cable   ← always running
+  mic-capture:     WASAPI capture → mic ring buffer         ← on demand only
+```
+
+### Architecture
+
+```
+Main thread:       Win32 message pump + system tray icon
+Session monitor:   WASAPI session callbacks → Resume/Pause engine
+Engine thread:     AEC processing loop
+  WarmPipeline (always running):
+    loopback:      speaker capture → reference buffer
+    render:        output buffer → virtual cable
+  MicCapture (on demand only):
+    mic-capture:   microphone → mic buffer
 ```
 
 Commands flow from the tray to the engine via a crossbeam channel (`SetMicDevice`, `SetSpeakerDevice`, `SetOutputDevice`, `RefreshDevices`, `Shutdown`). Device changes trigger a full pipeline restart. `RefreshDevices` is sent automatically on Windows session unlock and console connect events (via `WTSRegisterSessionNotification`).
+
+The session monitor registers `IAudioSessionNotification` callbacks on all capture devices at startup. When any external program opens CABLE Output for recording, the callback fires instantly (~0 ms), the engine opens the real microphone and starts AEC. When all recording sessions end, the engine releases the microphone — the mic-in-use indicator turns off. The loopback and render threads remain running throughout so there is no audio gap when recording resumes.
 
 ## Config File
 

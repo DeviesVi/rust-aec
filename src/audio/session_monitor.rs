@@ -1,186 +1,128 @@
-// Session monitor: detects when programs start/stop recording from any capture
-// device (excluding the real mic).
+// Session monitor: fully callback-driven, counter-free.
 //
-// Uses two complementary mechanisms:
-//   - IAudioSessionNotification COM callback for instant Resume on session creation.
-//   - 1-second background poll for debounced Pause when all sessions end.
+// Every relevant audio session callback (creation, state change, disconnect)
+// calls recheck(), which queries the OS directly for the current active
+// session count and sends Resume or Pause if the state changed.
 //
-// This allows the mic to be released (indicator off) when idle while keeping
-// startup latency to only the mic WASAPI open time (~20-50 ms).
+// No internal counter is maintained — the OS is the single source of truth.
+// This makes the monitor correct regardless of startup order, missed events,
+// or rapid session churn.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use windows::core::implement;
+use windows_core::Interface;
+use windows::Win32::Foundation::BOOL;
 use windows::Win32::Media::Audio::{
-    AudioSessionStateActive, IAudioSessionControl, IAudioSessionEnumerator,
-    IAudioSessionManager2, IAudioSessionNotification, IAudioSessionNotification_Impl,
-    IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
-    DEVICE_STATE_ACTIVE,
+    AudioSessionDisconnectReason, AudioSessionState, IAudioSessionControl,
+    IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionEvents,
+    IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification,
+    IAudioSessionNotification_Impl, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AudioSessionStateActive, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::Media::Audio::eCapture;
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 
 use crate::engine::EngineCommand;
 
-/// How long to wait after sessions drop to zero before pausing the engine.
-const PAUSE_DEBOUNCE: Duration = Duration::from_secs(3);
-
-/// Interval for the Pause-detection poll.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
-
 // ---------------------------------------------------------------------------
-// COM callback: fired immediately when any new session is created on a device.
+// Shared state — no counter, just the last command we sent.
 // ---------------------------------------------------------------------------
 
-#[implement(IAudioSessionNotification)]
-struct SessionNotification {
+struct SharedState {
+    excluded_mic_id: Option<String>,
     cmd_tx: Sender<EngineCommand>,
+    /// true = we last sent Resume; false = we last sent Pause (or haven't sent yet).
+    engine_running: AtomicBool,
+    verbose: bool,
+    /// WASAPI does NOT AddRef IAudioSessionEvents on RegisterAudioSessionNotification;
+    /// the caller must keep the objects alive for the duration of monitoring.
+    session_events: Mutex<Vec<(IAudioSessionControl, IAudioSessionEvents)>>,
 }
 
-impl IAudioSessionNotification_Impl for SessionNotification_Impl {
-    fn OnSessionCreated(
-        &self,
-        _new_session: Option<&IAudioSessionControl>,
-    ) -> windows::core::Result<()> {
-        // A new recording session just appeared — wake the engine immediately.
-        let _ = self.cmd_tx.send(EngineCommand::Resume);
-        Ok(())
-    }
-}
+unsafe impl Send for SharedState {}
+unsafe impl Sync for SharedState {}
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Recheck: ask the OS for the real count, send command only on change.
 // ---------------------------------------------------------------------------
 
-/// Register IAudioSessionNotification on every active capture device except
-/// `excluded_id`.  Returns the (manager, notification) pairs so the caller
-/// can keep them alive for the duration of the session.
-fn register_notifications(
-    excluded_id: Option<&str>,
-    cmd_tx: &Sender<EngineCommand>,
-) -> Vec<(IAudioSessionManager2, IAudioSessionNotification)> {
-    let mut keepers = Vec::new();
-    unsafe {
-        let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(
-            &MMDeviceEnumerator, None, CLSCTX_ALL,
-        ) else {
-            return keepers;
-        };
+fn recheck(state: &SharedState) {
+    // COM may not be initialized on the callback thread — initialize lazily.
+    unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
-        let Ok(collection) =
-            enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
-        else {
-            return keepers;
-        };
-        let collection: IMMDeviceCollection = collection;
-
-        let count = match collection.GetCount() {
-            Ok(n) => n,
-            Err(_) => return keepers,
-        };
-
-        for i in 0..count {
-            let device: IMMDevice = match collection.Item(i) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            // Skip excluded mic device.
-            if let Some(excl) = excluded_id {
-                if let Ok(pwstr) = device.GetId() {
-                    let id = pwstr.to_string().unwrap_or_default();
-                    CoTaskMemFree(Some(pwstr.0 as *const _));
-                    if id == excl {
-                        continue;
-                    }
-                }
+    let active = count_active_sessions(state.excluded_mic_id.as_deref());
+    if active > 0 {
+        if !state.engine_running.swap(true, Ordering::SeqCst) {
+            if state.verbose {
+                eprintln!("[monitor] {} active session(s) → Resume", active);
             }
-
-            let manager: IAudioSessionManager2 =
-                match device.Activate(CLSCTX_ALL, None) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-            let notif: IAudioSessionNotification =
-                SessionNotification { cmd_tx: cmd_tx.clone() }.into();
-
-            if manager.RegisterSessionNotification(&notif).is_ok() {
-                keepers.push((manager, notif));
+            let _ = state.cmd_tx.send(EngineCommand::Resume);
+        }
+    } else {
+        if state.engine_running.swap(false, Ordering::SeqCst) {
+            if state.verbose {
+                eprintln!("[monitor] 0 active sessions → Pause");
             }
+            let _ = state.cmd_tx.send(EngineCommand::Pause);
         }
     }
-    keepers
 }
 
-/// Count active recording sessions on all capture devices except `excluded_id`.
+// ---------------------------------------------------------------------------
+// Count active sessions on all capture devices except excluded_id.
+// ---------------------------------------------------------------------------
+
 fn count_active_sessions(excluded_id: Option<&str>) -> usize {
     unsafe {
-        let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(
-            &MMDeviceEnumerator, None, CLSCTX_ALL,
-        ) else {
-            return 0;
-        };
+        let Ok(enumerator) =
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else { return 0; };
 
         let Ok(collection) =
             enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
-        else {
-            return 0;
-        };
+        else { return 0; };
         let collection: IMMDeviceCollection = collection;
 
-        let device_count = match collection.GetCount() {
-            Ok(n) => n,
-            Err(_) => return 0,
-        };
-
+        let dev_count = match collection.GetCount() { Ok(n) => n, Err(_) => return 0 };
         let mut active = 0usize;
 
-        for i in 0..device_count {
-            let device: IMMDevice = match collection.Item(i) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+        for i in 0..dev_count {
+            let device: IMMDevice = match collection.Item(i) { Ok(d) => d, Err(_) => continue };
 
             if let Some(excl) = excluded_id {
                 if let Ok(pwstr) = device.GetId() {
                     let id = pwstr.to_string().unwrap_or_default();
                     CoTaskMemFree(Some(pwstr.0 as *const _));
-                    if id == excl {
-                        continue;
-                    }
+                    if id == excl { continue; }
                 }
             }
 
             let manager: IAudioSessionManager2 =
-                match device.Activate(CLSCTX_ALL, None) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
+                match device.Activate(CLSCTX_ALL, None) { Ok(m) => m, Err(_) => continue };
 
-            let session_enum: IAudioSessionEnumerator =
-                match manager.GetSessionEnumerator() {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-            let session_count = match session_enum.GetCount() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            let Ok(session_enum) = manager.GetSessionEnumerator() else { continue };
+            let session_enum: IAudioSessionEnumerator = session_enum;
+            let session_count = match session_enum.GetCount() { Ok(c) => c, Err(_) => continue };
 
             for j in 0..session_count {
                 let session: IAudioSessionControl =
-                    match session_enum.GetSession(j) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                if matches!(session.GetState(), Ok(s) if s == AudioSessionStateActive) {
-                    active += 1;
+                    match session_enum.GetSession(j) { Ok(s) => s, Err(_) => continue };
+                if !matches!(session.GetState(), Ok(s) if s == AudioSessionStateActive) {
+                    continue;
                 }
+                // Exclude sessions owned by this process (e.g. our own MicCapture).
+                if let Ok(s2) = session.cast::<IAudioSessionControl2>() {
+                    if s2.GetProcessId().ok() == Some(GetCurrentProcessId()) {
+                        continue;
+                    }
+                }
+                active += 1;
             }
         }
 
@@ -189,12 +131,140 @@ fn count_active_sessions(excluded_id: Option<&str>) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Per-session events — every event triggers a recheck.
 // ---------------------------------------------------------------------------
 
-/// Runs on its own thread.
-/// - Registers COM callbacks for instant Resume on new session creation.
-/// - Polls every second to send Pause after sessions disappear for 3 s.
+#[implement(IAudioSessionEvents)]
+struct SessionEvents {
+    state: Arc<SharedState>,
+}
+
+impl IAudioSessionEvents_Impl for SessionEvents_Impl {
+    fn OnDisplayNameChanged(
+        &self, _: &windows::core::PCWSTR, _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> { Ok(()) }
+
+    fn OnIconPathChanged(
+        &self, _: &windows::core::PCWSTR, _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> { Ok(()) }
+
+    fn OnSimpleVolumeChanged(
+        &self, _: f32, _: BOOL, _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> { Ok(()) }
+
+    fn OnChannelVolumeChanged(
+        &self, _: u32, _: *const f32, _: u32, _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> { Ok(()) }
+
+    fn OnGroupingParamChanged(
+        &self, _: *const windows::core::GUID, _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> { Ok(()) }
+
+    fn OnStateChanged(&self, _: AudioSessionState) -> windows::core::Result<()> {
+        recheck(&self.state);
+        Ok(())
+    }
+
+    fn OnSessionDisconnected(
+        &self, _: AudioSessionDisconnectReason,
+    ) -> windows::core::Result<()> {
+        recheck(&self.state);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-device session creation notification.
+// ---------------------------------------------------------------------------
+
+#[implement(IAudioSessionNotification)]
+struct SessionNotification {
+    state: Arc<SharedState>,
+}
+
+impl IAudioSessionNotification_Impl for SessionNotification_Impl {
+    fn OnSessionCreated(
+        &self, new_session: Option<&IAudioSessionControl>,
+    ) -> windows::core::Result<()> {
+        // Register per-session events so we catch state changes and disconnects.
+        if let Some(session) = new_session {
+            let evts: IAudioSessionEvents =
+                SessionEvents { state: Arc::clone(&self.state) }.into();
+            unsafe { let _ = session.RegisterAudioSessionNotification(&evts); }
+            // Must keep evts alive — WASAPI does not AddRef it.
+            self.state.session_events.lock().unwrap().push((session.clone(), evts));
+        }
+        recheck(&self.state);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Register IAudioSessionNotification + existing-session events on all
+// capture devices except excluded_id.
+// Returns keepers that must stay alive for the duration of the session.
+// ---------------------------------------------------------------------------
+
+fn register_all(
+    excluded_id: Option<&str>,
+    state: &Arc<SharedState>,
+) -> Vec<(IAudioSessionManager2, IAudioSessionNotification)> {
+    let mut keepers = Vec::new();
+    unsafe {
+        let Ok(enumerator) =
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else { return keepers; };
+
+        let Ok(collection) =
+            enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+        else { return keepers; };
+        let collection: IMMDeviceCollection = collection;
+
+        let dev_count = match collection.GetCount() { Ok(n) => n, Err(_) => return keepers };
+
+        for i in 0..dev_count {
+            let device: IMMDevice = match collection.Item(i) { Ok(d) => d, Err(_) => continue };
+
+            if let Some(excl) = excluded_id {
+                if let Ok(pwstr) = device.GetId() {
+                    let id = pwstr.to_string().unwrap_or_default();
+                    CoTaskMemFree(Some(pwstr.0 as *const _));
+                    if id == excl { continue; }
+                }
+            }
+
+            let manager: IAudioSessionManager2 =
+                match device.Activate(CLSCTX_ALL, None) { Ok(m) => m, Err(_) => continue };
+
+            // Register for future sessions.
+            let notif: IAudioSessionNotification =
+                SessionNotification { state: Arc::clone(state) }.into();
+            if manager.RegisterSessionNotification(&notif).is_ok() {
+                keepers.push((manager.clone(), notif));
+            }
+
+            // Register events on sessions that already exist.
+            let Ok(session_enum) = manager.GetSessionEnumerator() else { continue };
+            let session_enum: IAudioSessionEnumerator = session_enum;
+            let session_count = match session_enum.GetCount() { Ok(c) => c, Err(_) => continue };
+            for j in 0..session_count {
+                let session: IAudioSessionControl =
+                    match session_enum.GetSession(j) { Ok(s) => s, Err(_) => continue };
+                let evts: IAudioSessionEvents =
+                    SessionEvents { state: Arc::clone(state) }.into();
+                let _ = session.RegisterAudioSessionNotification(&evts);
+                // Must keep evts alive — WASAPI does not AddRef it.
+                state.session_events.lock().unwrap().push((session, evts));
+            }
+        }
+    }
+    keepers
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point.
+// ---------------------------------------------------------------------------
+
 pub fn session_monitor_loop(
     excluded_mic_id: Option<String>,
     cmd_tx: Sender<EngineCommand>,
@@ -203,56 +273,33 @@ pub fn session_monitor_loop(
 ) {
     crate::audio::device::com_init().expect("COM init failed in session-monitor thread");
 
-    // Register callbacks for instant detection of new sessions.
-    let _keepers = register_notifications(excluded_mic_id.as_deref(), &cmd_tx);
+    let state = Arc::new(SharedState {
+        excluded_mic_id,
+        cmd_tx,
+        engine_running: AtomicBool::new(false),
+        verbose,
+        session_events: Mutex::new(Vec::new()),
+    });
+
+    let _keepers = register_all(state.excluded_mic_id.as_deref(), &state);
+
     if verbose {
-        eprintln!("[monitor] registered session notifications on {} device(s)", _keepers.len());
+        eprintln!("[monitor] registered on {} device(s)", _keepers.len());
     }
 
-    // Initial check: sessions may already exist before we registered callbacks.
-    let initial = count_active_sessions(excluded_mic_id.as_deref());
-    let mut engine_active = initial > 0;
-    if engine_active {
-        if verbose {
-            eprintln!("[monitor] {} session(s) already active at startup — resuming", initial);
-        }
-        let _ = cmd_tx.send(EngineCommand::Resume);
-    }
-    let mut zero_since: Option<Instant> = if engine_active { None } else { Some(Instant::now()) };
+    // Initial check for sessions that existed before we registered.
+    recheck(&state);
 
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        std::thread::sleep(POLL_INTERVAL);
-
-        let active = count_active_sessions(excluded_mic_id.as_deref());
-
-        if active > 0 {
-            zero_since = None;
-            if !engine_active {
-                // Callbacks should have sent Resume already, but be safe.
-                engine_active = true;
-                if verbose {
-                    eprintln!("[monitor] {} session(s) active — resuming", active);
-                }
-                let _ = cmd_tx.send(EngineCommand::Resume);
-            }
-        } else {
-            let since = zero_since.get_or_insert_with(Instant::now);
-            if engine_active && since.elapsed() >= PAUSE_DEBOUNCE {
-                engine_active = false;
-                if verbose {
-                    eprintln!("[monitor] no active sessions — pausing engine");
-                }
-                let _ = cmd_tx.send(EngineCommand::Pause);
-            }
-        }
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(200));
     }
 
-    // Unregister callbacks on shutdown.
     for (manager, notif) in &_keepers {
         unsafe { let _ = manager.UnregisterSessionNotification(notif); }
+    }
+    let pairs = state.session_events.lock().unwrap();
+    for (session, evts) in pairs.iter() {
+        let evts_ref: &IAudioSessionEvents = evts;
+        unsafe { let _ = session.UnregisterAudioSessionNotification(evts_ref); }
     }
 }

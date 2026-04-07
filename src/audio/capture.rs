@@ -50,7 +50,7 @@ pub fn capture_loop(
         let bits = wfx.wBitsPerSample;
 
         while !stop.load(Ordering::Relaxed) {
-            let _ = WaitForSingleObject(event, 100);
+            let _ = WaitForSingleObject(event, 20);
 
             let mut packet_size = capture_client.GetNextPacketSize()?;
             while packet_size > 0 {
