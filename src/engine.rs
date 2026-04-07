@@ -1,5 +1,11 @@
 // Audio engine: manages AEC processing and audio threads.
 // Runs on its own thread; receives commands from the tray via crossbeam channel.
+//
+// Architecture:
+//   WarmPipeline  — loopback-capture + render threads, always running.
+//                   Keeps reference audio fresh and cable output silent while idle.
+//   MicCapture    — mic-capture thread, started/stopped on demand.
+//                   Only open while programs are actually recording (no idle indicator).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,11 +25,11 @@ pub enum EngineCommand {
     SetSpeakerDevice(String),
     SetOutputDevice(String),
     RefreshDevices,
-    /// Pause processing and release the microphone (sent by session monitor when
-    /// no programs are recording from any capture device).
+    /// Pause mic capture and release the microphone device.
+    /// Sent by the session monitor when no programs are recording.
     Pause,
-    /// Resume processing by (re)starting the pipeline (sent by session monitor
-    /// when a program begins recording from a capture device).
+    /// Start mic capture.
+    /// Sent by the session monitor when a program begins recording.
     Resume,
     Shutdown,
 }
@@ -32,65 +38,53 @@ pub struct AudioEngine {
     pub cmd_rx: Receiver<EngineCommand>,
     pub state: Arc<Mutex<TrayState>>,
     pub verbose: bool,
-    /// When true the pipeline starts paused and only activates on Resume commands.
-    pub on_demand: bool,
 }
 
-struct Pipeline {
-    mic_thread: Option<JoinHandle<Result<()>>>,
+// ---------------------------------------------------------------------------
+// WarmPipeline: loopback + render, always running.
+// ---------------------------------------------------------------------------
+
+struct WarmPipeline {
     ref_thread: Option<JoinHandle<Result<()>>>,
     out_thread: Option<JoinHandle<Result<()>>>,
-    mic_cons: crate::sync::AudioConsumer,
     ref_cons: crate::sync::AudioConsumer,
     out_prod: crate::sync::AudioProducer,
     stop: Arc<AtomicBool>,
 }
 
-impl Pipeline {
-    fn new(mic_id: &str, speaker_id: &str, output_id: &str) -> Result<Self> {
-        let buf_capacity = SAMPLE_RATE / 5; // 200ms
-        let mic_ring = AudioRingBuf::new(buf_capacity);
+impl WarmPipeline {
+    fn new(speaker_id: &str, output_id: &str) -> Result<Self> {
+        let buf_capacity = SAMPLE_RATE / 5; // 200 ms
+
         let ref_ring = AudioRingBuf::new(buf_capacity);
         let out_ring = AudioRingBuf::new(buf_capacity);
 
-        let (mic_prod, mic_cons) = mic_ring.split();
         let (ref_prod, ref_cons) = ref_ring.split();
         let (out_prod, out_cons) = out_ring.split();
 
         let stop = Arc::new(AtomicBool::new(false));
 
-        let stop_mic = stop.clone();
-        let mic_id_owned = mic_id.to_string();
-        let mic_thread = thread::Builder::new()
-            .name("mic-capture".into())
-            .spawn(move || {
-                device::com_init().expect("COM init failed in mic thread");
-                crate::audio::capture::capture_loop(&mic_id_owned, mic_prod, stop_mic)
-            })?;
-
         let stop_ref = stop.clone();
-        let speaker_id_owned = speaker_id.to_string();
+        let speaker_id = speaker_id.to_string();
         let ref_thread = thread::Builder::new()
             .name("loopback-capture".into())
             .spawn(move || {
                 device::com_init().expect("COM init failed in loopback thread");
-                crate::audio::loopback::loopback_loop(&speaker_id_owned, ref_prod, stop_ref)
+                crate::audio::loopback::loopback_loop(&speaker_id, ref_prod, stop_ref)
             })?;
 
         let stop_out = stop.clone();
-        let output_id_owned = output_id.to_string();
+        let output_id = output_id.to_string();
         let out_thread = thread::Builder::new()
             .name("render".into())
             .spawn(move || {
                 device::com_init().expect("COM init failed in render thread");
-                crate::audio::render::render_loop(&output_id_owned, out_cons, stop_out)
+                crate::audio::render::render_loop(&output_id, out_cons, stop_out)
             })?;
 
         Ok(Self {
-            mic_thread: Some(mic_thread),
             ref_thread: Some(ref_thread),
             out_thread: Some(out_thread),
-            mic_cons,
             ref_cons,
             out_prod,
             stop,
@@ -99,11 +93,6 @@ impl Pipeline {
 
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.mic_thread.take() {
-            if let Err(e) = h.join().unwrap_or(Ok(())) {
-                eprintln!("[error] mic-capture thread: {:#}", e);
-            }
-        }
         if let Some(h) = self.ref_thread.take() {
             if let Err(e) = h.join().unwrap_or(Ok(())) {
                 eprintln!("[error] loopback thread: {:#}", e);
@@ -117,8 +106,55 @@ impl Pipeline {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MicCapture: mic-capture thread, on-demand only.
+// ---------------------------------------------------------------------------
+
+struct MicCapture {
+    thread: Option<JoinHandle<Result<()>>>,
+    cons: crate::sync::AudioConsumer,
+    stop: Arc<AtomicBool>,
+}
+
+impl MicCapture {
+    fn new(mic_id: &str) -> Result<Self> {
+        let buf_capacity = SAMPLE_RATE / 5;
+        let mic_ring = AudioRingBuf::new(buf_capacity);
+        let (mic_prod, mic_cons) = mic_ring.split();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_mic = stop.clone();
+        let mic_id_owned = mic_id.to_string();
+
+        let thread = thread::Builder::new()
+            .name("mic-capture".into())
+            .spawn(move || {
+                device::com_init().expect("COM init failed in mic thread");
+                crate::audio::capture::capture_loop(&mic_id_owned, mic_prod, stop_mic)
+            })?;
+
+        Ok(Self {
+            thread: Some(thread),
+            cons: mic_cons,
+            stop,
+        })
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.thread.take() {
+            if let Err(e) = h.join().unwrap_or(Ok(())) {
+                eprintln!("[error] mic-capture thread: {:#}", e);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AudioEngine
+// ---------------------------------------------------------------------------
+
 impl AudioEngine {
-    /// Try to find a mic by re-enumerating capture devices.
     fn try_find_mic(state: &Mutex<TrayState>) -> Option<String> {
         let capture = device::list_capture_devices().ok()?;
         let mic_id = match device::default_capture_device_id() {
@@ -138,7 +174,6 @@ impl AudioEngine {
         mic_id
     }
 
-    /// Try to find a speaker (default render device).
     fn try_find_speaker(state: &Mutex<TrayState>) -> Option<String> {
         let render = device::list_render_devices().ok()?;
         let speaker_id = device::default_render_device_id().ok();
@@ -148,7 +183,6 @@ impl AudioEngine {
         speaker_id
     }
 
-    /// Try to find a virtual audio cable output device.
     fn try_find_output(state: &Mutex<TrayState>) -> Option<String> {
         let render = device::list_render_devices().ok()?;
         let output_id = device::find_device_id_by_name(&render, "cable input").ok();
@@ -158,7 +192,6 @@ impl AudioEngine {
         output_id
     }
 
-    /// Refresh all missing devices from state. Returns (mic, speaker, output).
     fn refresh_missing(&self) -> (Option<String>, Option<String>, Option<String>) {
         let (mic, spk, out) = {
             let st = self.state.lock().unwrap();
@@ -174,18 +207,6 @@ impl AudioEngine {
         (mic, spk, out)
     }
 
-    /// Try to start the pipeline if all devices are available.
-    fn try_start_pipeline(
-        mic_id: &Option<String>,
-        speaker_id: &Option<String>,
-        output_id: &Option<String>,
-    ) -> Option<Result<Pipeline>> {
-        match (mic_id.as_ref(), speaker_id.as_ref(), output_id.as_ref()) {
-            (Some(m), Some(s), Some(o)) => Some(Pipeline::new(m, s, o)),
-            _ => None,
-        }
-    }
-
     pub fn run(&self) -> Result<()> {
         device::com_init()?;
 
@@ -198,244 +219,231 @@ impl AudioEngine {
             )
         };
 
-        let mut pipeline: Option<Pipeline> = None;
+        let mut warm: Option<WarmPipeline> = None;
+        let mut mic_capture: Option<MicCapture> = None;
         let mut processor: Option<AecProcessor> = None;
+
         let mut mic_frame = vec![0.0f32; FRAME_SIZE];
         let mut ref_frame = vec![0.0f32; FRAME_SIZE];
         let mut out_frame = vec![0.0f32; FRAME_SIZE];
         let mut frames_processed: u64 = 0;
         let mut last_report = Instant::now();
-        // When on_demand is enabled the pipeline starts in paused state and
-        // only activates when a Resume command arrives from the session monitor.
-        let mut paused = self.on_demand;
 
-        // Start pipeline immediately unless we are in on-demand mode.
-        if !paused {
-            match Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
-                Some(Ok(p)) => {
-                    pipeline = Some(p);
-                    processor = Some(AecProcessor::new()?);
-                }
-                Some(Err(e)) => {
+        // Start the warm pipeline immediately (loopback + render, no mic).
+        match (&speaker_id, &output_id) {
+            (Some(spk), Some(out)) => match WarmPipeline::new(spk, out) {
+                Ok(p) => {
+                    warm = Some(p);
                     if self.verbose {
-                        eprintln!("[engine] Failed to start pipeline: {:#}", e);
+                        eprintln!("[engine] Warm pipeline started (loopback + render).");
                     }
-                    mic_id = None;
-                    self.state.lock().unwrap().current_mic_id = None;
                 }
-                None => {
+                Err(e) => {
                     if self.verbose {
-                        eprintln!(
-                            "[engine] Waiting for devices (mic={}, speaker={}, output={})...",
-                            mic_id.is_some(),
-                            speaker_id.is_some(),
-                            output_id.is_some(),
-                        );
+                        eprintln!("[engine] Failed to start warm pipeline: {:#}", e);
                     }
+                }
+            },
+            _ => {
+                if self.verbose {
+                    eprintln!(
+                        "[engine] Waiting for speaker/output devices (speaker={}, output={})...",
+                        speaker_id.is_some(),
+                        output_id.is_some(),
+                    );
                 }
             }
-        } else if self.verbose {
-            eprintln!("[engine] On-demand mode: waiting for session monitor to resume.");
         }
 
         loop {
-            // Check for commands (non-blocking).
+            // ----------------------------------------------------------------
+            // Process commands (non-blocking).
+            // ----------------------------------------------------------------
             match self.cmd_rx.try_recv() {
                 Ok(EngineCommand::Shutdown) => {
-                    if let Some(ref mut p) = pipeline {
-                        p.shutdown();
+                    if let Some(ref mut mc) = mic_capture {
+                        mc.shutdown();
+                    }
+                    if let Some(ref mut w) = warm {
+                        w.shutdown();
                     }
                     return Ok(());
                 }
+
                 Ok(EngineCommand::SetMicDevice(new_id)) => {
-                    if let Some(ref mut p) = pipeline {
-                        p.shutdown();
-                        pipeline = None;
+                    if let Some(ref mut mc) = mic_capture {
+                        mc.shutdown();
+                        mic_capture = None;
                         processor = None;
                     }
                     mic_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_mic_id = Some(new_id);
-                    if !paused {
-                        if let Some(result) = Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
-                            pipeline = Some(result?);
-                            processor = Some(AecProcessor::new()?);
-                            frames_processed = 0;
-                            if self.verbose {
-                                eprintln!("[engine] Switched mic device, pipeline restarted.");
-                            }
-                        }
-                    }
                 }
+
                 Ok(EngineCommand::SetSpeakerDevice(new_id)) => {
-                    if let Some(ref mut p) = pipeline {
-                        p.shutdown();
-                        pipeline = None;
-                        processor = None;
-                    }
+                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                    mic_capture = None;
+                    processor = None;
+                    if let Some(ref mut w) = warm { w.shutdown(); }
+                    warm = None;
                     speaker_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_speaker_id = Some(new_id);
-                    if !paused {
-                        if let Some(result) = Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
-                            pipeline = Some(result?);
-                            processor = Some(AecProcessor::new()?);
-                            frames_processed = 0;
-                            if self.verbose {
-                                eprintln!("[engine] Switched speaker device, pipeline restarted.");
+                    if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
+                        match WarmPipeline::new(spk, out) {
+                            Ok(p) => {
+                                warm = Some(p);
+                                if self.verbose { eprintln!("[engine] Warm pipeline restarted (new speaker)."); }
                             }
+                            Err(e) => { if self.verbose { eprintln!("[engine] Failed to restart warm pipeline: {:#}", e); } }
                         }
                     }
                 }
+
                 Ok(EngineCommand::SetOutputDevice(new_id)) => {
-                    if let Some(ref mut p) = pipeline {
-                        p.shutdown();
-                        pipeline = None;
-                        processor = None;
-                    }
+                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                    mic_capture = None;
+                    processor = None;
+                    if let Some(ref mut w) = warm { w.shutdown(); }
+                    warm = None;
                     output_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_output_id = Some(new_id);
-                    if !paused {
-                        if let Some(result) = Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
-                            pipeline = Some(result?);
-                            processor = Some(AecProcessor::new()?);
-                            frames_processed = 0;
-                            if self.verbose {
-                                eprintln!("[engine] Switched output device, pipeline restarted.");
+                    if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
+                        match WarmPipeline::new(spk, out) {
+                            Ok(p) => {
+                                warm = Some(p);
+                                if self.verbose { eprintln!("[engine] Warm pipeline restarted (new output)."); }
                             }
+                            Err(e) => { if self.verbose { eprintln!("[engine] Failed to restart warm pipeline: {:#}", e); } }
                         }
                     }
                 }
+
                 Ok(EngineCommand::RefreshDevices) => {
-                    if self.verbose {
-                        eprintln!("[engine] Refreshing devices...");
-                    }
-                    if let Some(ref mut p) = pipeline {
-                        p.shutdown();
-                        pipeline = None;
-                        processor = None;
-                    }
+                    if self.verbose { eprintln!("[engine] Refreshing devices..."); }
+                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                    mic_capture = None;
+                    processor = None;
+                    if let Some(ref mut w) = warm { w.shutdown(); }
+                    warm = None;
                     let (new_mic, new_spk, new_out) = self.refresh_missing();
                     mic_id = new_mic;
                     speaker_id = new_spk;
                     output_id = new_out;
-                    if !paused {
-                        match Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
-                            Some(Ok(p)) => {
-                                pipeline = Some(p);
-                                processor = Some(AecProcessor::new()?);
-                                frames_processed = 0;
-                                if self.verbose {
-                                    eprintln!("[engine] Pipeline (re)started after device refresh.");
-                                }
+                    if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
+                        match WarmPipeline::new(spk, out) {
+                            Ok(p) => {
+                                warm = Some(p);
+                                if self.verbose { eprintln!("[engine] Warm pipeline started after refresh."); }
                             }
-                            Some(Err(e)) => {
-                                if self.verbose {
-                                    eprintln!("[engine] Failed to start pipeline: {:#}", e);
-                                }
-                            }
-                            None => {
-                                if self.verbose {
-                                    eprintln!(
-                                        "[engine] Still waiting for devices (mic={}, speaker={}, output={}).",
-                                        mic_id.is_some(),
-                                        speaker_id.is_some(),
-                                        output_id.is_some(),
-                                    );
-                                }
-                            }
+                            Err(e) => { if self.verbose { eprintln!("[engine] Failed to start warm pipeline after refresh: {:#}", e); } }
                         }
                     }
                 }
+
                 Ok(EngineCommand::Pause) => {
-                    if !paused {
-                        paused = true;
-                        if let Some(ref mut p) = pipeline {
-                            p.shutdown();
-                            pipeline = None;
-                            processor = None;
-                        }
-                        if self.verbose {
-                            eprintln!("[engine] Paused (mic released).");
-                        }
+                    if mic_capture.is_some() {
+                        if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                        mic_capture = None;
+                        processor = None;
+                        if self.verbose { eprintln!("[engine] Mic released (paused)."); }
                     }
                 }
+
                 Ok(EngineCommand::Resume) => {
-                    paused = false;
-                    // (Re)start pipeline if not already running.
-                    if pipeline.is_none() {
-                        let (new_mic, new_spk, new_out) = self.refresh_missing();
-                        mic_id = new_mic.or(mic_id);
-                        speaker_id = new_spk.or(speaker_id);
-                        output_id = new_out.or(output_id);
-                        match Self::try_start_pipeline(&mic_id, &speaker_id, &output_id) {
-                            Some(Ok(p)) => {
-                                pipeline = Some(p);
-                                processor = Some(AecProcessor::new()?);
-                                frames_processed = 0;
-                                if self.verbose {
-                                    eprintln!("[engine] Pipeline started on resume.");
+                    if mic_capture.is_none() {
+                        // Ensure warm pipeline is up first.
+                        if warm.is_none() {
+                            let (new_mic, new_spk, new_out) = self.refresh_missing();
+                            mic_id = new_mic.or(mic_id);
+                            speaker_id = new_spk.or(speaker_id);
+                            output_id = new_out.or(output_id);
+                            if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
+                                match WarmPipeline::new(spk, out) {
+                                    Ok(p) => { warm = Some(p); }
+                                    Err(e) => {
+                                        if self.verbose { eprintln!("[engine] Failed to start warm pipeline on resume: {:#}", e); }
+                                    }
                                 }
                             }
-                            Some(Err(e)) => {
-                                if self.verbose {
-                                    eprintln!("[engine] Failed to start pipeline on resume: {:#}", e);
+                        }
+                        // Resolve mic ID if needed.
+                        let resolved_mic = mic_id.clone().or_else(|| Self::try_find_mic(&self.state));
+                        mic_id = resolved_mic.clone().or(mic_id);
+                        if let (Some(m), true) = (&resolved_mic, warm.is_some()) {
+                            match MicCapture::new(m) {
+                                Ok(mc) => {
+                                    mic_capture = Some(mc);
+                                    processor = Some(AecProcessor::new()?);
+                                    frames_processed = 0;
+                                    if self.verbose { eprintln!("[engine] Mic started (resumed)."); }
                                 }
-                            }
-                            None => {
-                                if self.verbose {
-                                    eprintln!("[engine] Resume: missing devices, staying idle.");
+                                Err(e) => {
+                                    if self.verbose { eprintln!("[engine] Failed to start mic on resume: {:#}", e); }
+                                    mic_id = None;
+                                    self.state.lock().unwrap().current_mic_id = None;
                                 }
                             }
                         }
                     }
                 }
+
                 Err(_) => {}
             }
 
-            // If no pipeline, sleep and wait for commands.
-            if pipeline.is_none() {
+            // ----------------------------------------------------------------
+            // Audio processing loop.
+            // ----------------------------------------------------------------
+            let Some(warm) = warm.as_mut() else {
                 thread::sleep(std::time::Duration::from_millis(100));
                 continue;
-            }
-            let p = pipeline.as_mut().unwrap();
-            let proc = processor.as_mut().unwrap();
+            };
 
-            if p.mic_cons.available() < FRAME_SIZE {
-                thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
+            if let Some(mc) = mic_capture.as_mut() {
+                // --- Mic active: wait for a frame then run AEC ---
+                if mc.cons.available() < FRAME_SIZE {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
 
-            p.mic_cons.pop(&mut mic_frame);
+                mc.cons.pop(&mut mic_frame);
 
-            let ref_available = p.ref_cons.available().min(FRAME_SIZE);
-            p.ref_cons.pop(&mut ref_frame[..ref_available]);
-            ref_frame[ref_available..].fill(0.0);
+                let ref_available = warm.ref_cons.available().min(FRAME_SIZE);
+                warm.ref_cons.pop(&mut ref_frame[..ref_available]);
+                ref_frame[ref_available..].fill(0.0);
 
-            if ref_available == 0 {
-                // No reference audio in the ring buffer means no speaker output
-                // for at least 200 ms (the full buffer capacity drained).  With no
-                // far-end signal there is no echo to cancel, so pass the mic
-                // through directly — skipping AEC saves significant CPU.
-                out_frame.copy_from_slice(&mic_frame);
+                if ref_available == 0 {
+                    // No far-end audio: pass through directly.
+                    out_frame.copy_from_slice(&mic_frame);
+                } else {
+                    processor.as_mut().unwrap().process_frame(&mic_frame, &ref_frame, &mut out_frame);
+                }
+
+                warm.out_prod.push(&out_frame);
+                frames_processed += 1;
+
+                if self.verbose && last_report.elapsed().as_secs() >= 2 {
+                    let mic_peak = mic_frame.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                    let out_peak = out_frame.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                    println!(
+                        "[diag] frames={}, mic_peak={:.4}, out_peak={:.4}, mic_buf={}, ref_buf={}, out_buf={}",
+                        frames_processed, mic_peak, out_peak,
+                        mc.cons.available(),
+                        warm.ref_cons.available(),
+                        warm.out_prod.available(),
+                    );
+                    last_report = Instant::now();
+                }
             } else {
-                proc.process_frame(&mic_frame, &ref_frame, &mut out_frame);
-            }
-
-            p.out_prod.push(&out_frame);
-            frames_processed += 1;
-
-            if self.verbose && last_report.elapsed().as_secs() >= 2 {
-                let mic_peak = mic_frame.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                let out_peak = out_frame.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                println!(
-                    "[diag] frames={}, mic_peak={:.4}, out_peak={:.4}, mic_buf={}, ref_buf={}, out_buf={}",
-                    frames_processed,
-                    mic_peak,
-                    out_peak,
-                    p.mic_cons.available(),
-                    p.ref_cons.available(),
-                    p.out_prod.available(),
-                );
-                last_report = Instant::now();
+                // --- Mic idle: drain ref_ring to keep it current; output silence ---
+                // This prevents the ref ring from filling with stale audio and
+                // ensures the render thread always has data (silence) to write.
+                let available = warm.ref_cons.available();
+                if available >= FRAME_SIZE {
+                    warm.ref_cons.pop(&mut ref_frame[..FRAME_SIZE]);
+                }
+                out_frame.fill(0.0);
+                warm.out_prod.push(&out_frame);
+                thread::sleep(std::time::Duration::from_millis(10));
             }
         }
     }

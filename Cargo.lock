@@ -210,6 +210,7 @@ dependencies = [
  "ringbuf",
  "sonora",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

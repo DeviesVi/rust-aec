@@ -264,7 +264,6 @@ fn run(verbose: bool) -> Result<()> {
                 cmd_rx,
                 state: engine_state,
                 verbose,
-                on_demand: true,
             };
             if let Err(e) = engine.run() {
                 eprintln!("[error] engine: {:#}", e);
