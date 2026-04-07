@@ -16,6 +16,7 @@ mod engine;
 mod sync;
 mod tray;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -263,16 +264,41 @@ fn run(verbose: bool) -> Result<()> {
                 cmd_rx,
                 state: engine_state,
                 verbose,
+                on_demand: true,
             };
             if let Err(e) = engine.run() {
                 eprintln!("[error] engine: {:#}", e);
             }
         })?;
 
+    // --- Spawn session monitor thread ---
+    // Watches all capture devices (except the real mic) for active recording
+    // sessions. Sends Resume/Pause commands to the engine so the mic is only
+    // held open while something is actually recording from the cable output.
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let monitor_stop_clone = monitor_stop.clone();
+    let monitor_cmd_tx = cmd_tx.clone();
+    let monitor_mic_id = {
+        let st = state.lock().unwrap();
+        st.current_mic_id.clone()
+    };
+    let monitor_thread = thread::Builder::new()
+        .name("session-monitor".into())
+        .spawn(move || {
+            crate::audio::session_monitor::session_monitor_loop(
+                monitor_mic_id,
+                monitor_cmd_tx,
+                monitor_stop_clone,
+                verbose,
+            );
+        })?;
+
     // --- Run system tray on main thread (message pump) ---
     tray::run_tray(state, cmd_tx)?;
 
-    // Tray message pump exited — wait for engine.
+    // Tray message pump exited — stop monitor and wait for engine.
+    monitor_stop.store(true, Ordering::Relaxed);
+    monitor_thread.join().ok();
     engine_thread.join().ok();
 
     Ok(())
