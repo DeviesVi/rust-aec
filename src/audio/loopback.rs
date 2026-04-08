@@ -18,11 +18,13 @@ use crate::sync::AudioProducer;
 
 /// Run the loopback capture loop on a render device.
 /// Captures system audio output and pushes mono f32 samples into `producer`.
+/// While `paused` is true the WASAPI buffer is still drained but data is discarded.
 /// Blocks until `stop` is set to true.
 pub fn loopback_loop(
     render_device_id: &str,
     mut producer: AudioProducer,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let mm_device = device::open_device_by_id(render_device_id)?;
     unsafe {
@@ -74,7 +76,8 @@ pub fn loopback_loop(
                 // AUDCLNT_BUFFERFLAGS_SILENT (0x2): no real audio playing.
                 // Skip conversion/resampling/push so the engine sees an empty
                 // ref buffer and can bypass AEC entirely.
-                if flags & 0x2 != 0 {
+                // While paused: drain the WASAPI buffer but discard — no push.
+                if flags & 0x2 != 0 || paused.load(Ordering::Relaxed) {
                     capture_client.ReleaseBuffer(num_frames)?;
                     packet_size = capture_client.GetNextPacketSize()?;
                     continue;

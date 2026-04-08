@@ -17,11 +17,14 @@ use crate::sync::AudioConsumer;
 
 /// Run the render loop, pulling processed samples from `consumer` and writing
 /// them to the given render device (expected to be a virtual audio cable).
+/// While `paused` is true silence is written to the device without consuming
+/// from the ring, keeping the WASAPI stream alive.
 /// Blocks until `stop` is set to true.
 pub fn render_loop(
     device_id: &str,
     mut consumer: AudioConsumer,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let mm_device = device::open_device_by_id(device_id)?;
     unsafe {
@@ -65,6 +68,14 @@ pub fn render_loop(
             let padding = audio_client.GetCurrentPadding()?;
             let available_frames = (buffer_size - padding) as usize;
             if available_frames == 0 {
+                continue;
+            }
+
+            // While paused: write silence directly without touching the ring.
+            if paused.load(Ordering::Relaxed) {
+                let buffer = render_client.GetBuffer(available_frames as u32)?;
+                std::ptr::write_bytes(buffer, 0, available_frames * wfx.nBlockAlign as usize);
+                render_client.ReleaseBuffer(available_frames as u32, 0)?;
                 continue;
             }
 

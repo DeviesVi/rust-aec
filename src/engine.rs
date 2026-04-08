@@ -40,16 +40,6 @@ pub struct AudioEngine {
     pub verbose: bool,
 }
 
-fn drain_consumer(consumer: &mut crate::sync::AudioConsumer, scratch: &mut [f32]) {
-    loop {
-        let to_read = consumer.available().min(scratch.len());
-        if to_read == 0 {
-            break;
-        }
-        consumer.pop(&mut scratch[..to_read]);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // RefPipeline: loopback-capture + render threads.
 // ---------------------------------------------------------------------------
@@ -60,10 +50,11 @@ struct RefPipeline {
     ref_cons: crate::sync::AudioConsumer,
     out_prod: crate::sync::AudioProducer,
     stop: Arc<AtomicBool>,
+    _paused: Arc<AtomicBool>,
 }
 
 impl RefPipeline {
-    fn new(speaker_id: &str, output_id: &str) -> Result<Self> {
+    fn new(speaker_id: &str, output_id: &str, paused: Arc<AtomicBool>) -> Result<Self> {
         let buf_capacity = SAMPLE_RATE / 5; // 200 ms
 
         let ref_ring = AudioRingBuf::new(buf_capacity);
@@ -75,21 +66,23 @@ impl RefPipeline {
         let stop = Arc::new(AtomicBool::new(false));
 
         let stop_ref = stop.clone();
+        let paused_ref = paused.clone();
         let speaker_id = speaker_id.to_string();
         let ref_thread = thread::Builder::new()
             .name("loopback-capture".into())
             .spawn(move || {
                 let _com = device::com_init().expect("COM init failed in loopback thread");
-                crate::audio::loopback::loopback_loop(&speaker_id, ref_prod, stop_ref)
+                crate::audio::loopback::loopback_loop(&speaker_id, ref_prod, stop_ref, paused_ref)
             })?;
 
         let stop_out = stop.clone();
+        let paused_out = paused.clone();
         let output_id = output_id.to_string();
         let out_thread = thread::Builder::new()
             .name("render".into())
             .spawn(move || {
                 let _com = device::com_init().expect("COM init failed in render thread");
-                crate::audio::render::render_loop(&output_id, out_cons, stop_out)
+                crate::audio::render::render_loop(&output_id, out_cons, stop_out, paused_out)
             })?;
 
         Ok(Self {
@@ -98,6 +91,7 @@ impl RefPipeline {
             ref_cons,
             out_prod,
             stop,
+            _paused: paused,
         })
     }
 
@@ -236,14 +230,14 @@ impl AudioEngine {
         let mut mic_frame = vec![0.0f32; FRAME_SIZE];
         let mut ref_frame = vec![0.0f32; FRAME_SIZE];
         let mut out_frame = vec![0.0f32; FRAME_SIZE];
-        let mut drain_buf = vec![0.0f32; FRAME_SIZE];
         let mut frames_processed: u64 = 0;
         let mut last_report = Instant::now();
         let mut paused = true;
+        let paused_flag = Arc::new(AtomicBool::new(true));
 
         // Start long-lived reference threads immediately if devices are known.
         match (&speaker_id, &output_id) {
-            (Some(spk), Some(out)) => match RefPipeline::new(spk, out) {
+            (Some(spk), Some(out)) => match RefPipeline::new(spk, out, paused_flag.clone()) {
                 Ok(p) => {
                     ref_pipe = Some(p);
                     if self.verbose {
@@ -301,7 +295,7 @@ impl AudioEngine {
                     speaker_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_speaker_id = Some(new_id);
                     if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
-                        match RefPipeline::new(spk, out) {
+                        match RefPipeline::new(spk, out, paused_flag.clone()) {
                             Ok(p) => {
                                 ref_pipe = Some(p);
                                 if self.verbose { eprintln!("[engine] Reference pipeline restarted (new speaker)."); }
@@ -320,7 +314,7 @@ impl AudioEngine {
                     output_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_output_id = Some(new_id);
                     if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
-                        match RefPipeline::new(spk, out) {
+                        match RefPipeline::new(spk, out, paused_flag.clone()) {
                             Ok(p) => {
                                 ref_pipe = Some(p);
                                 if self.verbose { eprintln!("[engine] Reference pipeline restarted (new output)."); }
@@ -342,7 +336,7 @@ impl AudioEngine {
                     speaker_id = new_spk;
                     output_id = new_out;
                     if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
-                        match RefPipeline::new(spk, out) {
+                        match RefPipeline::new(spk, out, paused_flag.clone()) {
                             Ok(p) => {
                                 ref_pipe = Some(p);
                                 if self.verbose { eprintln!("[engine] Reference pipeline started after refresh."); }
@@ -354,6 +348,7 @@ impl AudioEngine {
 
                 Ok(EngineCommand::Pause) => {
                     paused = true;
+                    paused_flag.store(true, Ordering::Relaxed);
                     if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
                     mic_capture = None;
                     if self.verbose {
@@ -370,7 +365,7 @@ impl AudioEngine {
                         speaker_id = new_spk.or(speaker_id);
                         output_id = new_out.or(output_id);
                         if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
-                            match RefPipeline::new(spk, out) {
+                            match RefPipeline::new(spk, out, paused_flag.clone()) {
                                 Ok(p) => { ref_pipe = Some(p); }
                                 Err(e) => {
                                     if self.verbose { eprintln!("[engine] Failed to start reference pipeline on resume: {:#}", e); }
@@ -398,6 +393,8 @@ impl AudioEngine {
                     if processor.is_none() && mic_capture.is_some() && ref_pipe.is_some() {
                         processor = Some(AecProcessor::new()?);
                     }
+                    // Ungate the ref-pipeline threads only after mic is ready.
+                    paused_flag.store(false, Ordering::Relaxed);
                     frames_processed = 0;
                     if self.verbose && mic_capture.is_some() && ref_pipe.is_some() {
                         eprintln!("[engine] Resumed with persistent threads/resources.");
@@ -416,10 +413,9 @@ impl AudioEngine {
             };
 
             if paused {
-                drain_consumer(&mut ref_pipe.ref_cons, &mut drain_buf);
-                out_frame.fill(0.0);
-                ref_pipe.out_prod.push(&out_frame);
-                thread::sleep(std::time::Duration::from_millis(10));
+                // Loopback discards WASAPI data and render writes silence on their own;
+                // the engine thread has nothing to do while paused.
+                thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
 
@@ -466,8 +462,7 @@ impl AudioEngine {
                 }
                 out_frame.fill(0.0);
                 ref_pipe.out_prod.push(&out_frame);
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
+                thread::sleep(std::time::Duration::from_millis(10));            }
         }
     }
 }
