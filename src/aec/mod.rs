@@ -28,7 +28,10 @@ impl AecProcessor {
             .capture_config(stream_config)
             .render_config(stream_config)
             .build();
-        Ok(Self { apm, render_buf: vec![0.0f32; FRAME_SIZE] })
+        Ok(Self {
+            apm,
+            render_buf: vec![0.0f32; FRAME_SIZE],
+        })
     }
 
     /// Process one 10ms frame.

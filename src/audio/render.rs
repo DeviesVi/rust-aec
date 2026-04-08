@@ -3,7 +3,6 @@
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Media::Audio::{
     IAudioClient, IAudioRenderClient, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -12,7 +11,8 @@ use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::aec::SAMPLE_RATE;
-use crate::audio::device;
+use crate::audio::device::{self, CoTaskMemGuard, HandleGuard};
+use crate::audio::pcm::{resample_into, resize_zeroed};
 use crate::sync::AudioConsumer;
 
 /// Run the render loop, pulling processed samples from `consumer` and writing
@@ -27,22 +27,22 @@ pub fn render_loop(
     unsafe {
         let audio_client: IAudioClient = mm_device.Activate(CLSCTX_ALL, None)?;
 
-        let pwfx = audio_client.GetMixFormat()?;
-        let wfx = &*pwfx;
+        let pwfx = CoTaskMemGuard::new(audio_client.GetMixFormat()?);
+        let wfx = &*pwfx.get();
 
         audio_client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
             100_000,
             0,
-            pwfx,
+            pwfx.get(),
             None,
         )?;
 
         let buffer_size = audio_client.GetBufferSize()?;
 
-        let event: HANDLE = CreateEventW(None, false, false, None)?;
-        audio_client.SetEventHandle(event)?;
+        let event = HandleGuard::new(CreateEventW(None, false, false, None)?);
+        audio_client.SetEventHandle(event.get())?;
 
         let render_client: IAudioRenderClient = audio_client.GetService()?;
 
@@ -51,6 +51,8 @@ pub fn render_loop(
         let device_channels = wfx.nChannels as usize;
         let device_rate = wfx.nSamplesPerSec as usize;
         let bits = wfx.wBitsPerSample;
+        let mut mono_buf = Vec::new();
+        let mut resampled_buf = Vec::new();
 
         println!(
             "[render] device: channels={}, rate={}, bits={}, buffer_size={}",
@@ -58,7 +60,7 @@ pub fn render_loop(
         );
 
         while !stop.load(Ordering::Relaxed) {
-            let _ = WaitForSingleObject(event, 20);
+            let _ = WaitForSingleObject(event.get(), 20);
 
             let padding = audio_client.GetCurrentPadding()?;
             let available_frames = (buffer_size - padding) as usize;
@@ -74,15 +76,16 @@ pub fn render_loop(
                 available_frames
             };
 
-            let mut mono_buf = vec![0.0f32; mono_frames_needed];
+            resize_zeroed(&mut mono_buf, mono_frames_needed);
             consumer.pop(&mut mono_buf);
             // Unread portion stays zero (silence), ensuring gap-free output.
 
             // Resample if needed.
             let mono_buf = if device_rate != SAMPLE_RATE {
-                simple_resample(&mono_buf, SAMPLE_RATE, device_rate)
+                resample_into(&mono_buf, SAMPLE_RATE, device_rate, &mut resampled_buf);
+                resampled_buf.as_slice()
             } else {
-                mono_buf
+                mono_buf.as_slice()
             };
 
             let frames_to_write = mono_buf.len().min(available_frames);
@@ -136,21 +139,3 @@ unsafe fn write_to_device_buffer(
     }
 }}
 
-/// Naive linear resampling.
-fn simple_resample(input: &[f32], from_rate: usize, to_rate: usize) -> Vec<f32> {
-    if from_rate == to_rate || input.is_empty() {
-        return input.to_vec();
-    }
-    let ratio = from_rate as f64 / to_rate as f64;
-    let out_len = ((input.len() as f64) / ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_idx = i as f64 * ratio;
-        let idx = src_idx as usize;
-        let frac = (src_idx - idx as f64) as f32;
-        let s0 = input[idx.min(input.len() - 1)];
-        let s1 = input[(idx + 1).min(input.len() - 1)];
-        output.push(s0 + frac * (s1 - s0));
-    }
-    output
-}

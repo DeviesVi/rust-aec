@@ -1,10 +1,9 @@
 // Audio engine: manages AEC processing and audio threads.
 // Runs on its own thread; receives commands from the tray via crossbeam channel.
 //
-// Three audio threads, all started on Resume and stopped on Pause:
-//   loopback-capture  — captures speaker output as the AEC reference signal.
-//   render            — writes processed audio to the virtual cable output.
-//   mic-capture       — captures the microphone for AEC processing.
+// The reference pipeline (loopback-capture + render) can stay alive while idle
+// so Pause/Resume does not rebuild all long-lived resources every time.
+// Mic capture still stops on Pause so the real microphone is released.
 //
 // Resume latency: ~50-100 ms (concurrent WASAPI init across all three threads).
 
@@ -26,10 +25,10 @@ pub enum EngineCommand {
     SetSpeakerDevice(String),
     SetOutputDevice(String),
     RefreshDevices,
-    /// Stop all audio threads and release all devices.
-    /// Sent by the session monitor when no programs are recording.
+    /// Pause processing and release the real microphone.
+    /// Long-lived reference/AEC resources may stay warm to keep memory stable.
     Pause,
-    /// Start all audio threads.
+    /// Resume processing, restarting the microphone if needed.
     /// Sent by the session monitor when a program begins recording.
     Resume,
     Shutdown,
@@ -39,6 +38,16 @@ pub struct AudioEngine {
     pub cmd_rx: Receiver<EngineCommand>,
     pub state: Arc<Mutex<TrayState>>,
     pub verbose: bool,
+}
+
+fn drain_consumer(consumer: &mut crate::sync::AudioConsumer, scratch: &mut [f32]) {
+    loop {
+        let to_read = consumer.available().min(scratch.len());
+        if to_read == 0 {
+            break;
+        }
+        consumer.pop(&mut scratch[..to_read]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +79,7 @@ impl RefPipeline {
         let ref_thread = thread::Builder::new()
             .name("loopback-capture".into())
             .spawn(move || {
-                device::com_init().expect("COM init failed in loopback thread");
+                let _com = device::com_init().expect("COM init failed in loopback thread");
                 crate::audio::loopback::loopback_loop(&speaker_id, ref_prod, stop_ref)
             })?;
 
@@ -79,7 +88,7 @@ impl RefPipeline {
         let out_thread = thread::Builder::new()
             .name("render".into())
             .spawn(move || {
-                device::com_init().expect("COM init failed in render thread");
+                let _com = device::com_init().expect("COM init failed in render thread");
                 crate::audio::render::render_loop(&output_id, out_cons, stop_out)
             })?;
 
@@ -130,7 +139,7 @@ impl MicCapture {
         let thread = thread::Builder::new()
             .name("mic-capture".into())
             .spawn(move || {
-                device::com_init().expect("COM init failed in mic thread");
+                let _com = device::com_init().expect("COM init failed in mic thread");
                 crate::audio::capture::capture_loop(&mic_id_owned, mic_prod, stop_mic)
             })?;
 
@@ -209,7 +218,7 @@ impl AudioEngine {
     }
 
     pub fn run(&self) -> Result<()> {
-        device::com_init()?;
+        let _com = device::com_init()?;
 
         let (mut mic_id, mut speaker_id, mut output_id) = {
             let st = self.state.lock().unwrap();
@@ -222,15 +231,17 @@ impl AudioEngine {
 
         let mut ref_pipe: Option<RefPipeline> = None;
         let mut mic_capture: Option<MicCapture> = None;
-        let mut processor: Option<AecProcessor> = None;
+        let mut processor: Option<AecProcessor> = Some(AecProcessor::new()?);
 
         let mut mic_frame = vec![0.0f32; FRAME_SIZE];
         let mut ref_frame = vec![0.0f32; FRAME_SIZE];
         let mut out_frame = vec![0.0f32; FRAME_SIZE];
+        let mut drain_buf = vec![0.0f32; FRAME_SIZE];
         let mut frames_processed: u64 = 0;
         let mut last_report = Instant::now();
+        let mut paused = true;
 
-        // Start all threads immediately if devices are known.
+        // Start long-lived reference threads immediately if devices are known.
         match (&speaker_id, &output_id) {
             (Some(spk), Some(out)) => match RefPipeline::new(spk, out) {
                 Ok(p) => {
@@ -342,41 +353,39 @@ impl AudioEngine {
                 }
 
                 Ok(EngineCommand::Pause) => {
+                    paused = true;
                     if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
                     mic_capture = None;
-                    processor = None;
-                    if let Some(ref mut p) = ref_pipe { p.shutdown(); }
-                    ref_pipe = None;
-                    if self.verbose { eprintln!("[engine] All threads stopped (paused)."); }
+                    if self.verbose {
+                        eprintln!("[engine] Processing paused; microphone released, reference pipeline kept alive.");
+                    }
                 }
 
                 Ok(EngineCommand::Resume) => {
-                    if mic_capture.is_none() {
-                        // Start loopback-capture and render threads if not running.
-                        if ref_pipe.is_none() {
-                            let (new_mic, new_spk, new_out) = self.refresh_missing();
-                            mic_id = new_mic.or(mic_id);
-                            speaker_id = new_spk.or(speaker_id);
-                            output_id = new_out.or(output_id);
-                            if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
-                                match RefPipeline::new(spk, out) {
-                                    Ok(p) => { ref_pipe = Some(p); }
-                                    Err(e) => {
-                                        if self.verbose { eprintln!("[engine] Failed to start reference pipeline on resume: {:#}", e); }
-                                    }
+                    paused = false;
+                    // Start loopback-capture and render threads if not running.
+                    if ref_pipe.is_none() {
+                        let (new_mic, new_spk, new_out) = self.refresh_missing();
+                        mic_id = new_mic.or(mic_id);
+                        speaker_id = new_spk.or(speaker_id);
+                        output_id = new_out.or(output_id);
+                        if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
+                            match RefPipeline::new(spk, out) {
+                                Ok(p) => { ref_pipe = Some(p); }
+                                Err(e) => {
+                                    if self.verbose { eprintln!("[engine] Failed to start reference pipeline on resume: {:#}", e); }
                                 }
                             }
                         }
-                        // Start mic-capture thread.
+                    }
+                    // Start mic-capture thread if not already persistent.
+                    if mic_capture.is_none() {
                         let resolved_mic = mic_id.clone().or_else(|| Self::try_find_mic(&self.state));
                         mic_id = resolved_mic.clone().or(mic_id);
                         if let (Some(m), true) = (&resolved_mic, ref_pipe.is_some()) {
                             match MicCapture::new(m) {
                                 Ok(mc) => {
                                     mic_capture = Some(mc);
-                                    processor = Some(AecProcessor::new()?);
-                                    frames_processed = 0;
-                                    if self.verbose { eprintln!("[engine] All threads started (resumed)."); }
                                 }
                                 Err(e) => {
                                     if self.verbose { eprintln!("[engine] Failed to start mic-capture on resume: {:#}", e); }
@@ -385,6 +394,13 @@ impl AudioEngine {
                                 }
                             }
                         }
+                    }
+                    if processor.is_none() && mic_capture.is_some() && ref_pipe.is_some() {
+                        processor = Some(AecProcessor::new()?);
+                    }
+                    frames_processed = 0;
+                    if self.verbose && mic_capture.is_some() && ref_pipe.is_some() {
+                        eprintln!("[engine] Resumed with persistent threads/resources.");
                     }
                 }
 
@@ -398,6 +414,14 @@ impl AudioEngine {
                 thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             };
+
+            if paused {
+                drain_consumer(&mut ref_pipe.ref_cons, &mut drain_buf);
+                out_frame.fill(0.0);
+                ref_pipe.out_prod.push(&out_frame);
+                thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
 
             if let Some(mc) = mic_capture.as_mut() {
                 // --- All threads running: wait for a mic frame then run AEC ---

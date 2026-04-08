@@ -15,7 +15,7 @@
 // (second real mic, webcam, etc.) are never counted.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -29,11 +29,11 @@ use windows::Win32::Media::Audio::{
     IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionEvents,
     IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification,
     IAudioSessionNotification_Impl, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AudioSessionStateActive, DEVICE_STATE_ACTIVE,
+    MMDeviceEnumerator, AudioSessionStateActive, AudioSessionStateExpired, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::Media::Audio::eCapture;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED, STGM,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
@@ -58,6 +58,9 @@ struct SharedState {
     /// WASAPI does NOT AddRef IAudioSessionEvents on RegisterAudioSessionNotification;
     /// the caller must keep the objects alive for the duration of monitoring.
     session_events: Mutex<Vec<(IAudioSessionControl, IAudioSessionEvents)>>,
+    /// Set by disconnect/expiry callbacks so the monitor loop can unregister and
+    /// drop stale session callbacks instead of letting the keeper Vec grow forever.
+    needs_prune: AtomicBool,
 }
 
 unsafe impl Send for SharedState {}
@@ -98,9 +101,14 @@ fn resolve_watch_container(output_render_id: &str) -> Option<GUID> {
 
 fn recheck(state: &SharedState) {
     // COM may not be initialized on the callback thread — initialize lazily.
-    unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
 
     let active = count_active_sessions(state.watch_container_id.as_ref());
+
+    if com_initialized {
+        unsafe { CoUninitialize(); }
+    }
+
     if active > 0 {
         if !state.engine_running.swap(true, Ordering::SeqCst) {
             if state.verbose {
@@ -116,6 +124,20 @@ fn recheck(state: &SharedState) {
             let _ = state.cmd_tx.send(EngineCommand::Pause);
         }
     }
+}
+
+fn prune_expired_sessions(state: &SharedState) {
+    let mut events = state.session_events.lock().unwrap();
+    events.retain(|(session, evts)| {
+        let expired = matches!(
+            unsafe { session.GetState() },
+            Ok(s) if s == AudioSessionStateExpired
+        );
+        if expired {
+            unsafe { let _ = session.UnregisterAudioSessionNotification(evts); }
+        }
+        !expired
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +202,7 @@ fn count_active_sessions(watch_cid: Option<&GUID>) -> usize {
 
 #[implement(IAudioSessionEvents)]
 struct SessionEvents {
-    state: Arc<SharedState>,
+    state: Weak<SharedState>,
 }
 
 impl IAudioSessionEvents_Impl for SessionEvents_Impl {
@@ -204,15 +226,23 @@ impl IAudioSessionEvents_Impl for SessionEvents_Impl {
         &self, _: *const windows::core::GUID, _: *const windows::core::GUID,
     ) -> windows::core::Result<()> { Ok(()) }
 
-    fn OnStateChanged(&self, _: AudioSessionState) -> windows::core::Result<()> {
-        recheck(&self.state);
+    fn OnStateChanged(&self, new_state: AudioSessionState) -> windows::core::Result<()> {
+        if let Some(state) = self.state.upgrade() {
+            if new_state == AudioSessionStateExpired {
+                state.needs_prune.store(true, Ordering::Release);
+            }
+            recheck(&state);
+        }
         Ok(())
     }
 
     fn OnSessionDisconnected(
         &self, _: AudioSessionDisconnectReason,
     ) -> windows::core::Result<()> {
-        recheck(&self.state);
+        if let Some(state) = self.state.upgrade() {
+            state.needs_prune.store(true, Ordering::Release);
+            recheck(&state);
+        }
         Ok(())
     }
 }
@@ -232,7 +262,7 @@ impl IAudioSessionNotification_Impl for SessionNotification_Impl {
     ) -> windows::core::Result<()> {
         if let Some(session) = new_session {
             let evts: IAudioSessionEvents =
-                SessionEvents { state: Arc::clone(&self.state) }.into();
+                SessionEvents { state: Arc::downgrade(&self.state) }.into();
             unsafe { let _ = session.RegisterAudioSessionNotification(&evts); }
             // Must keep evts alive — WASAPI does not AddRef it.
             self.state.session_events.lock().unwrap().push((session.clone(), evts));
@@ -292,7 +322,7 @@ fn register_all(
                 let session: IAudioSessionControl =
                     match session_enum.GetSession(j) { Ok(s) => s, Err(_) => continue };
                 let evts: IAudioSessionEvents =
-                    SessionEvents { state: Arc::clone(state) }.into();
+                    SessionEvents { state: Arc::downgrade(state) }.into();
                 let _ = session.RegisterAudioSessionNotification(&evts);
                 state.session_events.lock().unwrap().push((session, evts));
             }
@@ -314,7 +344,7 @@ pub fn session_monitor_loop(
     stop: Arc<AtomicBool>,
     verbose: bool,
 ) {
-    crate::audio::device::com_init().expect("COM init failed in session-monitor thread");
+    let _com = crate::audio::device::com_init().expect("COM init failed in session-monitor thread");
 
     let watch_container_id = output_render_id
         .as_deref()
@@ -333,6 +363,7 @@ pub fn session_monitor_loop(
         engine_running: AtomicBool::new(false),
         verbose,
         session_events: Mutex::new(Vec::new()),
+        needs_prune: AtomicBool::new(false),
     });
 
     let _keepers = register_all(state.watch_container_id.as_ref(), &state);
@@ -345,13 +376,16 @@ pub fn session_monitor_loop(
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(200));
+        if state.needs_prune.swap(false, Ordering::AcqRel) {
+            prune_expired_sessions(&state);
+        }
     }
 
     for (manager, notif) in &_keepers {
         unsafe { let _ = manager.UnregisterSessionNotification(notif); }
     }
-    let pairs = state.session_events.lock().unwrap();
-    for (session, evts) in pairs.iter() {
-        unsafe { let _ = session.UnregisterAudioSessionNotification(evts); }
+    let mut pairs = state.session_events.lock().unwrap();
+    for (session, evts) in pairs.drain(..) {
+        unsafe { let _ = session.UnregisterAudioSessionNotification(&evts); }
     }
 }
