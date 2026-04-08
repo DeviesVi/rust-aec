@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
@@ -263,10 +263,20 @@ impl AudioEngine {
 
         loop {
             // ----------------------------------------------------------------
-            // Process commands (non-blocking).
+            // Process commands. While paused or waiting for a reference
+            // pipeline, the engine blocks here instead of polling.
             // ----------------------------------------------------------------
-            match self.cmd_rx.try_recv() {
-                Ok(EngineCommand::Shutdown) => {
+            let next_cmd = if paused || ref_pipe.is_none() {
+                match self.cmd_rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => return Ok(()),
+                }
+            } else {
+                self.cmd_rx.try_recv().ok()
+            };
+
+            match next_cmd {
+                Some(EngineCommand::Shutdown) => {
                     if let Some(ref mut mc) = mic_capture {
                         mc.shutdown();
                     }
@@ -276,21 +286,25 @@ impl AudioEngine {
                     return Ok(());
                 }
 
-                Ok(EngineCommand::SetMicDevice(new_id)) => {
+                Some(EngineCommand::SetMicDevice(new_id)) => {
                     if let Some(ref mut mc) = mic_capture {
                         mc.shutdown();
                         mic_capture = None;
-                        processor = None;
                     }
+                    processor = None;
                     mic_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_mic_id = Some(new_id);
                 }
 
-                Ok(EngineCommand::SetSpeakerDevice(new_id)) => {
-                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                Some(EngineCommand::SetSpeakerDevice(new_id)) => {
+                    if let Some(ref mut mc) = mic_capture {
+                        mc.shutdown();
+                    }
                     mic_capture = None;
                     processor = None;
-                    if let Some(ref mut p) = ref_pipe { p.shutdown(); }
+                    if let Some(ref mut p) = ref_pipe {
+                        p.shutdown();
+                    }
                     ref_pipe = None;
                     speaker_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_speaker_id = Some(new_id);
@@ -298,18 +312,33 @@ impl AudioEngine {
                         match RefPipeline::new(spk, out, paused_flag.clone()) {
                             Ok(p) => {
                                 ref_pipe = Some(p);
-                                if self.verbose { eprintln!("[engine] Reference pipeline restarted (new speaker)."); }
+                                if self.verbose {
+                                    eprintln!(
+                                        "[engine] Reference pipeline restarted (new speaker)."
+                                    );
+                                }
                             }
-                            Err(e) => { if self.verbose { eprintln!("[engine] Failed to restart reference pipeline: {:#}", e); } }
+                            Err(e) => {
+                                if self.verbose {
+                                    eprintln!(
+                                        "[engine] Failed to restart reference pipeline: {:#}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
 
-                Ok(EngineCommand::SetOutputDevice(new_id)) => {
-                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                Some(EngineCommand::SetOutputDevice(new_id)) => {
+                    if let Some(ref mut mc) = mic_capture {
+                        mc.shutdown();
+                    }
                     mic_capture = None;
                     processor = None;
-                    if let Some(ref mut p) = ref_pipe { p.shutdown(); }
+                    if let Some(ref mut p) = ref_pipe {
+                        p.shutdown();
+                    }
                     ref_pipe = None;
                     output_id = Some(new_id.clone());
                     self.state.lock().unwrap().current_output_id = Some(new_id);
@@ -317,19 +346,36 @@ impl AudioEngine {
                         match RefPipeline::new(spk, out, paused_flag.clone()) {
                             Ok(p) => {
                                 ref_pipe = Some(p);
-                                if self.verbose { eprintln!("[engine] Reference pipeline restarted (new output)."); }
+                                if self.verbose {
+                                    eprintln!(
+                                        "[engine] Reference pipeline restarted (new output)."
+                                    );
+                                }
                             }
-                            Err(e) => { if self.verbose { eprintln!("[engine] Failed to restart reference pipeline: {:#}", e); } }
+                            Err(e) => {
+                                if self.verbose {
+                                    eprintln!(
+                                        "[engine] Failed to restart reference pipeline: {:#}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
 
-                Ok(EngineCommand::RefreshDevices) => {
-                    if self.verbose { eprintln!("[engine] Refreshing devices..."); }
-                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                Some(EngineCommand::RefreshDevices) => {
+                    if self.verbose {
+                        eprintln!("[engine] Refreshing devices...");
+                    }
+                    if let Some(ref mut mc) = mic_capture {
+                        mc.shutdown();
+                    }
                     mic_capture = None;
                     processor = None;
-                    if let Some(ref mut p) = ref_pipe { p.shutdown(); }
+                    if let Some(ref mut p) = ref_pipe {
+                        p.shutdown();
+                    }
                     ref_pipe = None;
                     let (new_mic, new_spk, new_out) = self.refresh_missing();
                     mic_id = new_mic;
@@ -339,24 +385,37 @@ impl AudioEngine {
                         match RefPipeline::new(spk, out, paused_flag.clone()) {
                             Ok(p) => {
                                 ref_pipe = Some(p);
-                                if self.verbose { eprintln!("[engine] Reference pipeline started after refresh."); }
+                                if self.verbose {
+                                    eprintln!("[engine] Reference pipeline started after refresh.");
+                                }
                             }
-                            Err(e) => { if self.verbose { eprintln!("[engine] Failed to start reference pipeline after refresh: {:#}", e); } }
+                            Err(e) => {
+                                if self.verbose {
+                                    eprintln!(
+                                        "[engine] Failed to start reference pipeline after refresh: {:#}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
 
-                Ok(EngineCommand::Pause) => {
+                Some(EngineCommand::Pause) => {
                     paused = true;
                     paused_flag.store(true, Ordering::Relaxed);
-                    if let Some(ref mut mc) = mic_capture { mc.shutdown(); }
+                    if let Some(ref mut mc) = mic_capture {
+                        mc.shutdown();
+                    }
                     mic_capture = None;
                     if self.verbose {
-                        eprintln!("[engine] Processing paused; microphone released, reference pipeline kept alive.");
+                        eprintln!(
+                            "[engine] Processing paused; microphone released, reference pipeline kept alive."
+                        );
                     }
                 }
 
-                Ok(EngineCommand::Resume) => {
+                Some(EngineCommand::Resume) => {
                     paused = false;
                     // Start loopback-capture and render threads if not running.
                     if ref_pipe.is_none() {
@@ -366,16 +425,24 @@ impl AudioEngine {
                         output_id = new_out.or(output_id);
                         if let (Some(spk), Some(out)) = (&speaker_id, &output_id) {
                             match RefPipeline::new(spk, out, paused_flag.clone()) {
-                                Ok(p) => { ref_pipe = Some(p); }
+                                Ok(p) => {
+                                    ref_pipe = Some(p);
+                                }
                                 Err(e) => {
-                                    if self.verbose { eprintln!("[engine] Failed to start reference pipeline on resume: {:#}", e); }
+                                    if self.verbose {
+                                        eprintln!(
+                                            "[engine] Failed to start reference pipeline on resume: {:#}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                     // Start mic-capture thread if not already persistent.
                     if mic_capture.is_none() {
-                        let resolved_mic = mic_id.clone().or_else(|| Self::try_find_mic(&self.state));
+                        let resolved_mic =
+                            mic_id.clone().or_else(|| Self::try_find_mic(&self.state));
                         mic_id = resolved_mic.clone().or(mic_id);
                         if let (Some(m), true) = (&resolved_mic, ref_pipe.is_some()) {
                             match MicCapture::new(m) {
@@ -383,7 +450,12 @@ impl AudioEngine {
                                     mic_capture = Some(mc);
                                 }
                                 Err(e) => {
-                                    if self.verbose { eprintln!("[engine] Failed to start mic-capture on resume: {:#}", e); }
+                                    if self.verbose {
+                                        eprintln!(
+                                            "[engine] Failed to start mic-capture on resume: {:#}",
+                                            e
+                                        );
+                                    }
                                     mic_id = None;
                                     self.state.lock().unwrap().current_mic_id = None;
                                 }
@@ -393,7 +465,9 @@ impl AudioEngine {
                     if processor.is_none() && mic_capture.is_some() && ref_pipe.is_some() {
                         processor = Some(AecProcessor::new()?);
                     }
-                    // Ungate the ref-pipeline threads only after mic is ready.
+                    // Let the persistent reference threads run again. If mic
+                    // startup failed, the engine keeps feeding silence until a
+                    // later retry command succeeds.
                     paused_flag.store(false, Ordering::Relaxed);
                     frames_processed = 0;
                     if self.verbose && mic_capture.is_some() && ref_pipe.is_some() {
@@ -401,28 +475,24 @@ impl AudioEngine {
                     }
                 }
 
-                Err(_) => {}
+                None => {}
             }
 
             // ----------------------------------------------------------------
             // Audio processing loop.
             // ----------------------------------------------------------------
             let Some(ref_pipe) = ref_pipe.as_mut() else {
-                thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             };
 
             if paused {
-                // Loopback discards WASAPI data and render writes silence on their own;
-                // the engine thread has nothing to do while paused.
-                thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
 
             if let Some(mc) = mic_capture.as_mut() {
                 // --- All threads running: wait for a mic frame then run AEC ---
                 if mc.cons.available() < FRAME_SIZE {
-                    thread::sleep(std::time::Duration::from_millis(1));
+                    thread::sleep(Duration::from_millis(1));
                     continue;
                 }
 
@@ -436,7 +506,11 @@ impl AudioEngine {
                     // No far-end audio: pass through directly.
                     out_frame.copy_from_slice(&mic_frame);
                 } else {
-                    processor.as_mut().unwrap().process_frame(&mic_frame, &ref_frame, &mut out_frame);
+                    processor.as_mut().unwrap().process_frame(
+                        &mic_frame,
+                        &ref_frame,
+                        &mut out_frame,
+                    );
                 }
 
                 ref_pipe.out_prod.push(&out_frame);
@@ -447,7 +521,9 @@ impl AudioEngine {
                     let out_peak = out_frame.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                     println!(
                         "[diag] frames={}, mic_peak={:.4}, out_peak={:.4}, mic_buf={}, ref_buf={}, out_buf={}",
-                        frames_processed, mic_peak, out_peak,
+                        frames_processed,
+                        mic_peak,
+                        out_peak,
                         mc.cons.available(),
                         ref_pipe.ref_cons.available(),
                         ref_pipe.out_prod.available(),
@@ -462,7 +538,8 @@ impl AudioEngine {
                 }
                 out_frame.fill(0.0);
                 ref_pipe.out_prod.push(&out_frame);
-                thread::sleep(std::time::Duration::from_millis(10));            }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }

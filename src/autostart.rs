@@ -1,12 +1,12 @@
 // Windows autostart via HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
 
-use anyhow::{bail, Result};
-use windows::core::PCWSTR;
+use anyhow::{Result, bail};
 use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW,
+    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
+use windows::core::PCWSTR;
 
 const SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const VALUE_NAME: &str = "RustAEC";
@@ -37,15 +37,7 @@ pub fn is_autostart_enabled() -> bool {
         if res.0 != 0 {
             return false;
         }
-        let ok = RegQueryValueExW(
-            hkey,
-            PCWSTR(value_name.as_ptr()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .0 == 0;
+        let ok = RegQueryValueExW(hkey, PCWSTR(value_name.as_ptr()), None, None, None, None).0 == 0;
         let _ = RegCloseKey(hkey);
         ok
     }
@@ -69,10 +61,8 @@ pub fn enable_autostart() -> Result<()> {
             "RegOpenKeyExW",
         )?;
         let path_wide = wide_str(&path_str);
-        let path_bytes: &[u8] = std::slice::from_raw_parts(
-            path_wide.as_ptr() as *const u8,
-            path_wide.len() * 2,
-        );
+        let path_bytes: &[u8] =
+            std::slice::from_raw_parts(path_wide.as_ptr() as *const u8, path_wide.len() * 2);
         check(
             RegSetValueExW(
                 hkey,

@@ -2,11 +2,11 @@
 // Captures system audio output (what you hear) for use as the AEC reference signal.
 
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    IAudioCaptureClient, IAudioClient,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -63,13 +63,7 @@ pub fn loopback_loop(
                 let mut buffer = std::ptr::null_mut();
                 let mut num_frames = 0u32;
                 let mut flags = 0u32;
-                capture_client.GetBuffer(
-                    &mut buffer,
-                    &mut num_frames,
-                    &mut flags,
-                    None,
-                    None,
-                )?;
+                capture_client.GetBuffer(&mut buffer, &mut num_frames, &mut flags, None, None)?;
 
                 let frames = num_frames as usize;
 

@@ -45,10 +45,13 @@ fn main() {
 }
 
 fn show_error_box(msg: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let wide_msg: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_title: Vec<u16> = "Rust AEC".encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_title: Vec<u16> = "Rust AEC"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         MessageBoxW(
             None,
@@ -117,14 +120,14 @@ fn run(verbose: bool) -> Result<()> {
     // Select mic: CLI arg > saved config ID > default (if not a cable) > first real mic.
     // Returns None when no mic is available (e.g. Remote Desktop with no audio).
     let mic_id: Option<String> = if let Some(q) = mic_query {
-        Some(
-            device::find_device_id_by_name(&capture_devices, q)
-                .context("Mic device not found")?,
-        )
+        Some(device::find_device_id_by_name(&capture_devices, q).context("Mic device not found")?)
     } else if let Some(id) = cfg.mic {
         if capture_devices.iter().any(|d| d.id == id) {
             if verbose {
-                println!("Mic: loaded from config ({})", device::device_name_by_id(&capture_devices, &id));
+                println!(
+                    "Mic: loaded from config ({})",
+                    device::device_name_by_id(&capture_devices, &id)
+                );
             }
             Some(id)
         } else {
@@ -175,7 +178,10 @@ fn run(verbose: bool) -> Result<()> {
     } else if let Some(id) = cfg.speaker {
         if render_devices.iter().any(|d| d.id == id) {
             if verbose {
-                println!("Speaker: loaded from config ({})", device::device_name_by_id(&render_devices, &id));
+                println!(
+                    "Speaker: loaded from config ({})",
+                    device::device_name_by_id(&render_devices, &id)
+                );
             }
             Some(id)
         } else {
@@ -202,7 +208,10 @@ fn run(verbose: bool) -> Result<()> {
     } else if let Some(id) = cfg.output {
         if render_devices.iter().any(|d| d.id == id) {
             if verbose {
-                println!("Output: loaded from config ({})", device::device_name_by_id(&render_devices, &id));
+                println!(
+                    "Output: loaded from config ({})",
+                    device::device_name_by_id(&render_devices, &id)
+                );
             }
             Some(id)
         } else {
@@ -222,10 +231,7 @@ fn run(verbose: bool) -> Result<()> {
 
     if verbose {
         match &mic_id {
-            Some(id) => println!(
-                "Mic: {}",
-                device::device_name_by_id(&capture_devices, id)
-            ),
+            Some(id) => println!("Mic: {}", device::device_name_by_id(&capture_devices, id)),
             None => println!("Mic: (none)"),
         }
         match &speaker_id {
@@ -236,10 +242,7 @@ fn run(verbose: bool) -> Result<()> {
             None => println!("Speaker: (none)"),
         }
         match &output_id {
-            Some(id) => println!(
-                "Output: {}",
-                device::device_name_by_id(&render_devices, id)
-            ),
+            Some(id) => println!("Output: {}", device::device_name_by_id(&render_devices, id)),
             None => println!("Output: (none)"),
         }
     }

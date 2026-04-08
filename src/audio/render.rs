@@ -1,11 +1,11 @@
 // WASAPI render client: outputs processed audio to a virtual audio cable device.
 
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Media::Audio::{
-    IAudioClient, IAudioRenderClient, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    IAudioClient, IAudioRenderClient,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -73,9 +73,9 @@ pub fn render_loop(
 
             // While paused: write silence directly without touching the ring.
             if paused.load(Ordering::Relaxed) {
-                let buffer = render_client.GetBuffer(available_frames as u32)?;
-                std::ptr::write_bytes(buffer, 0, available_frames * wfx.nBlockAlign as usize);
-                render_client.ReleaseBuffer(available_frames as u32, 0)?;
+                let _buffer = render_client.GetBuffer(available_frames as u32)?;
+                render_client
+                    .ReleaseBuffer(available_frames as u32, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
                 continue;
             }
 
@@ -105,12 +105,7 @@ pub fn render_loop(
             }
 
             let buffer = render_client.GetBuffer(frames_to_write as u32)?;
-            write_to_device_buffer(
-                buffer,
-                &mono_buf[..frames_to_write],
-                device_channels,
-                bits,
-            );
+            write_to_device_buffer(buffer, &mono_buf[..frames_to_write], device_channels, bits);
             render_client.ReleaseBuffer(frames_to_write as u32, 0)?;
         }
 
@@ -120,33 +115,29 @@ pub fn render_loop(
 }
 
 /// Write mono f32 samples into a WASAPI render buffer (multi-channel, various bit depths).
-unsafe fn write_to_device_buffer(
-    buffer: *mut u8,
-    mono: &[f32],
-    channels: usize,
-    bits: u16,
-) { unsafe {
-    match bits {
-        32 => {
-            let data =
-                std::slice::from_raw_parts_mut(buffer as *mut f32, mono.len() * channels);
-            for (i, &sample) in mono.iter().enumerate() {
-                for ch in 0..channels {
-                    data[i * channels + ch] = sample;
+unsafe fn write_to_device_buffer(buffer: *mut u8, mono: &[f32], channels: usize, bits: u16) {
+    unsafe {
+        match bits {
+            32 => {
+                let data =
+                    std::slice::from_raw_parts_mut(buffer as *mut f32, mono.len() * channels);
+                for (i, &sample) in mono.iter().enumerate() {
+                    for ch in 0..channels {
+                        data[i * channels + ch] = sample;
+                    }
                 }
             }
-        }
-        16 => {
-            let data =
-                std::slice::from_raw_parts_mut(buffer as *mut i16, mono.len() * channels);
-            for (i, &sample) in mono.iter().enumerate() {
-                let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                for ch in 0..channels {
-                    data[i * channels + ch] = s;
+            16 => {
+                let data =
+                    std::slice::from_raw_parts_mut(buffer as *mut i16, mono.len() * channels);
+                for (i, &sample) in mono.iter().enumerate() {
+                    let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    for ch in 0..channels {
+                        data[i * channels + ch] = s;
+                    }
                 }
             }
+            _ => {}
         }
-        _ => {}
     }
-}}
-
+}

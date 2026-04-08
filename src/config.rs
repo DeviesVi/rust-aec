@@ -17,10 +17,18 @@ fn config_path() -> Option<PathBuf> {
 
 pub fn load() -> Config {
     let Some(path) = config_path() else {
-        return Config { mic: None, speaker: None, output: None };
+        return Config {
+            mic: None,
+            speaker: None,
+            output: None,
+        };
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Config { mic: None, speaker: None, output: None };
+        return Config {
+            mic: None,
+            speaker: None,
+            output: None,
+        };
     };
     let mut map: HashMap<&str, &str> = HashMap::new();
     for line in text.lines() {

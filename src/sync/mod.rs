@@ -1,8 +1,8 @@
 // Lock-free ring buffer wrappers for inter-thread audio sample exchange.
 
 use ringbuf::{
-    traits::{Consumer, Observer, Producer, Split},
     HeapRb,
+    traits::{Consumer, Observer, Producer, Split},
 };
 
 /// Single-producer single-consumer ring buffer for f32 audio samples.

@@ -135,6 +135,7 @@ src/
     device.rs          # WASAPI device enumeration, cable filtering
     capture.rs         # Microphone capture thread
     loopback.rs        # Speaker loopback capture thread
+    pcm.rs             # Reusable PCM conversion/resampling scratch helpers
     render.rs          # Clean audio output thread (writes to virtual cable)
     session_monitor.rs # WASAPI session callbacks → Resume/Pause mic on demand
   aec/
@@ -170,13 +171,13 @@ Main thread:       Win32 message pump + system tray icon
 Session monitor:   WASAPI session callbacks → Resume/Pause commands
 Engine thread:     AEC processing loop
   loopback-capture:  speaker capture → reference buffer   ┐
-  render:            output buffer → virtual cable        ├─ all started on Resume
-  mic-capture:       microphone → mic buffer              ┘    stopped on Pause
+  render:            output buffer → virtual cable        ├─ ref pipeline stays warm across Pause
+  mic-capture:       microphone → mic buffer              ┘   mic still stops on Pause
 ```
 
 Commands flow from the tray to the engine via a crossbeam channel (`SetMicDevice`, `SetSpeakerDevice`, `SetOutputDevice`, `RefreshDevices`, `Shutdown`). Device changes trigger a full pipeline restart. `RefreshDevices` is sent automatically on Windows session unlock and console connect events (via `WTSRegisterSessionNotification`).
 
-The session monitor resolves the `PKEY_Device_ContainerId` of the configured output device (CABLE Input) at startup — a GUID shared by all endpoints of the same virtual audio device. It registers `IAudioSessionNotification` only on the matching capture endpoint (CABLE Output), ignoring all unrelated microphones and webcams. When any external program opens CABLE Output for recording, the callback fires instantly (~0 ms), the engine starts all three audio threads and begins AEC. When all recording sessions end, all three threads are stopped and all devices are released — the mic-in-use indicator turns off. Resume latency is ~50–100 ms (concurrent WASAPI init across all three threads).
+The session monitor resolves the `PKEY_Device_ContainerId` of the configured output device (CABLE Input) at startup — a GUID shared by all endpoints of the same virtual audio device. It registers `IAudioSessionNotification` only on the matching capture endpoint (CABLE Output), ignoring all unrelated microphones and webcams. Existing and newly created session callbacks are deduplicated by session-instance ID, and expired/disconnected callback keepers are pruned so long recording-session churn does not grow memory usage over time. When any external program opens CABLE Output for recording, the callback fires instantly (~0 ms), the engine resumes AEC processing and starts mic capture if needed. When all recording sessions end, the microphone is released immediately while the reference pipeline stays warm; the paused render thread writes silence via `AUDCLNT_BUFFERFLAGS_SILENT`, loopback discards data, and the engine blocks on the next command instead of polling.
 
 ## Config File
 

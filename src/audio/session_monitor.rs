@@ -20,23 +20,24 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
-use windows::core::{implement, GUID};
-use windows_core::Interface;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_ContainerId;
 use windows::Win32::Foundation::BOOL;
-use windows::Win32::Media::Audio::{
-    AudioSessionDisconnectReason, AudioSessionState, IAudioSessionControl,
-    IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionEvents,
-    IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification,
-    IAudioSessionNotification_Impl, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AudioSessionStateActive, AudioSessionStateExpired, DEVICE_STATE_ACTIVE,
-};
 use windows::Win32::Media::Audio::eCapture;
+use windows::Win32::Media::Audio::{
+    AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateActive,
+    AudioSessionStateExpired, DEVICE_STATE_ACTIVE, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionEnumerator, IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2,
+    IAudioSessionNotification, IAudioSessionNotification_Impl, IMMDevice, IMMDeviceCollection,
+    IMMDeviceEnumerator, MMDeviceEnumerator,
+};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED, STGM,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::core::{GUID, implement};
+use windows_core::Interface;
 
 use crate::engine::EngineCommand;
 
@@ -57,7 +58,7 @@ struct SharedState {
     verbose: bool,
     /// WASAPI does NOT AddRef IAudioSessionEvents on RegisterAudioSessionNotification;
     /// the caller must keep the objects alive for the duration of monitoring.
-    session_events: Mutex<Vec<(IAudioSessionControl, IAudioSessionEvents)>>,
+    session_events: Mutex<Vec<SessionEventKeeper>>,
     /// Set by disconnect/expiry callbacks so the monitor loop can unregister and
     /// drop stale session callbacks instead of letting the keeper Vec grow forever.
     needs_prune: AtomicBool,
@@ -65,6 +66,12 @@ struct SharedState {
 
 unsafe impl Send for SharedState {}
 unsafe impl Sync for SharedState {}
+
+struct SessionEventKeeper {
+    instance_id: Option<String>,
+    session: IAudioSessionControl,
+    evts: IAudioSessionEvents,
+}
 
 // ---------------------------------------------------------------------------
 // ContainerID helpers.
@@ -80,9 +87,13 @@ unsafe fn get_container_id(device: &IMMDevice) -> Option<GUID> {
     unsafe {
         let raw = &pv as *const _ as *const u8;
         let vt = u16::from_ne_bytes([*raw, *raw.add(1)]);
-        if vt != VT_CLSID { return None; }
+        if vt != VT_CLSID {
+            return None;
+        }
         let guid_ptr = *(raw.add(8) as *const *const GUID);
-        if guid_ptr.is_null() { return None; }
+        if guid_ptr.is_null() {
+            return None;
+        }
         Some(*guid_ptr) // copy before pv drops and PropVariantClear frees the pointer
     }
 }
@@ -106,7 +117,9 @@ fn recheck(state: &SharedState) {
     let active = count_active_sessions(state.watch_container_id.as_ref());
 
     if com_initialized {
-        unsafe { CoUninitialize(); }
+        unsafe {
+            CoUninitialize();
+        }
     }
 
     if active > 0 {
@@ -126,17 +139,93 @@ fn recheck(state: &SharedState) {
     }
 }
 
+unsafe fn pwstr_to_string_and_free(pwstr: windows_core::PWSTR) -> Option<String> {
+    if pwstr.0.is_null() {
+        return None;
+    }
+    let text = unsafe { pwstr.to_string() }.ok();
+    unsafe {
+        CoTaskMemFree(Some(pwstr.0 as *const _));
+    }
+    text
+}
+
+fn session_instance_id(session: &IAudioSessionControl) -> Option<String> {
+    let session2 = session.cast::<IAudioSessionControl2>().ok()?;
+    unsafe { pwstr_to_string_and_free(session2.GetSessionInstanceIdentifier().ok()?) }
+}
+
+fn same_session(
+    entry: &SessionEventKeeper,
+    session: &IAudioSessionControl,
+    instance_id: Option<&str>,
+) -> bool {
+    match (entry.instance_id.as_deref(), instance_id) {
+        (Some(existing), Some(current)) => existing == current,
+        _ => Interface::as_raw(&entry.session) == Interface::as_raw(session),
+    }
+}
+
+fn prune_session_events_locked(events: &mut Vec<SessionEventKeeper>) {
+    events.retain(|entry| {
+        let keep = matches!(
+            unsafe { entry.session.GetState() },
+            Ok(state) if state != AudioSessionStateExpired
+        );
+        if !keep {
+            unsafe {
+                let _ = entry
+                    .session
+                    .UnregisterAudioSessionNotification(&entry.evts);
+            }
+        }
+        keep
+    });
+}
+
 fn prune_expired_sessions(state: &SharedState) {
     let mut events = state.session_events.lock().unwrap();
-    events.retain(|(session, evts)| {
-        let expired = matches!(
-            unsafe { session.GetState() },
-            Ok(s) if s == AudioSessionStateExpired
-        );
-        if expired {
-            unsafe { let _ = session.UnregisterAudioSessionNotification(evts); }
+    prune_session_events_locked(&mut events);
+}
+
+fn register_session_events(state: &Arc<SharedState>, session: &IAudioSessionControl) {
+    let instance_id = session_instance_id(session);
+
+    {
+        let mut events = state.session_events.lock().unwrap();
+        prune_session_events_locked(&mut events);
+        if events
+            .iter()
+            .any(|entry| same_session(entry, session, instance_id.as_deref()))
+        {
+            return;
         }
-        !expired
+    }
+
+    let evts: IAudioSessionEvents = SessionEvents {
+        state: Arc::downgrade(state),
+    }
+    .into();
+    if unsafe { session.RegisterAudioSessionNotification(&evts) }.is_err() {
+        return;
+    }
+
+    let mut events = state.session_events.lock().unwrap();
+    prune_session_events_locked(&mut events);
+    if events
+        .iter()
+        .any(|entry| same_session(entry, session, instance_id.as_deref()))
+    {
+        unsafe {
+            let _ = session.UnregisterAudioSessionNotification(&evts);
+        }
+        return;
+    }
+
+    events.push(SessionEventKeeper {
+        instance_id,
+        session: session.clone(),
+        evts,
     });
 }
 
@@ -146,22 +235,32 @@ fn prune_expired_sessions(state: &SharedState) {
 // ---------------------------------------------------------------------------
 
 fn count_active_sessions(watch_cid: Option<&GUID>) -> usize {
-    let Some(target_cid) = watch_cid else { return 0; };
+    let Some(target_cid) = watch_cid else {
+        return 0;
+    };
     unsafe {
         let Ok(enumerator) =
             CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        else { return 0; };
+        else {
+            return 0;
+        };
 
-        let Ok(collection) =
-            enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
-        else { return 0; };
+        let Ok(collection) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+            return 0;
+        };
         let collection: IMMDeviceCollection = collection;
 
-        let dev_count = match collection.GetCount() { Ok(n) => n, Err(_) => return 0 };
+        let dev_count = match collection.GetCount() {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
         let mut active = 0usize;
 
         for i in 0..dev_count {
-            let device: IMMDevice = match collection.Item(i) { Ok(d) => d, Err(_) => continue };
+            let device: IMMDevice = match collection.Item(i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
 
             // Filter by ContainerID: only watch the virtual cable's capture endpoint(s).
             match get_container_id(&device) {
@@ -169,16 +268,25 @@ fn count_active_sessions(watch_cid: Option<&GUID>) -> usize {
                 _ => continue,                        // no match — skip
             }
 
-            let manager: IAudioSessionManager2 =
-                match device.Activate(CLSCTX_ALL, None) { Ok(m) => m, Err(_) => continue };
+            let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
 
-            let Ok(session_enum) = manager.GetSessionEnumerator() else { continue };
+            let Ok(session_enum) = manager.GetSessionEnumerator() else {
+                continue;
+            };
             let session_enum: IAudioSessionEnumerator = session_enum;
-            let session_count = match session_enum.GetCount() { Ok(c) => c, Err(_) => continue };
+            let session_count = match session_enum.GetCount() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
 
             for j in 0..session_count {
-                let session: IAudioSessionControl =
-                    match session_enum.GetSession(j) { Ok(s) => s, Err(_) => continue };
+                let session: IAudioSessionControl = match session_enum.GetSession(j) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
                 if !matches!(session.GetState(), Ok(s) if s == AudioSessionStateActive) {
                     continue;
                 }
@@ -207,24 +315,47 @@ struct SessionEvents {
 
 impl IAudioSessionEvents_Impl for SessionEvents_Impl {
     fn OnDisplayNameChanged(
-        &self, _: &windows::core::PCWSTR, _: *const windows::core::GUID,
-    ) -> windows::core::Result<()> { Ok(()) }
+        &self,
+        _: &windows::core::PCWSTR,
+        _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
 
     fn OnIconPathChanged(
-        &self, _: &windows::core::PCWSTR, _: *const windows::core::GUID,
-    ) -> windows::core::Result<()> { Ok(()) }
+        &self,
+        _: &windows::core::PCWSTR,
+        _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
 
     fn OnSimpleVolumeChanged(
-        &self, _: f32, _: BOOL, _: *const windows::core::GUID,
-    ) -> windows::core::Result<()> { Ok(()) }
+        &self,
+        _: f32,
+        _: BOOL,
+        _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
 
     fn OnChannelVolumeChanged(
-        &self, _: u32, _: *const f32, _: u32, _: *const windows::core::GUID,
-    ) -> windows::core::Result<()> { Ok(()) }
+        &self,
+        _: u32,
+        _: *const f32,
+        _: u32,
+        _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
 
     fn OnGroupingParamChanged(
-        &self, _: *const windows::core::GUID, _: *const windows::core::GUID,
-    ) -> windows::core::Result<()> { Ok(()) }
+        &self,
+        _: *const windows::core::GUID,
+        _: *const windows::core::GUID,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
 
     fn OnStateChanged(&self, new_state: AudioSessionState) -> windows::core::Result<()> {
         if let Some(state) = self.state.upgrade() {
@@ -236,9 +367,7 @@ impl IAudioSessionEvents_Impl for SessionEvents_Impl {
         Ok(())
     }
 
-    fn OnSessionDisconnected(
-        &self, _: AudioSessionDisconnectReason,
-    ) -> windows::core::Result<()> {
+    fn OnSessionDisconnected(&self, _: AudioSessionDisconnectReason) -> windows::core::Result<()> {
         if let Some(state) = self.state.upgrade() {
             state.needs_prune.store(true, Ordering::Release);
             recheck(&state);
@@ -258,14 +387,11 @@ struct SessionNotification {
 
 impl IAudioSessionNotification_Impl for SessionNotification_Impl {
     fn OnSessionCreated(
-        &self, new_session: Option<&IAudioSessionControl>,
+        &self,
+        new_session: Option<&IAudioSessionControl>,
     ) -> windows::core::Result<()> {
         if let Some(session) = new_session {
-            let evts: IAudioSessionEvents =
-                SessionEvents { state: Arc::downgrade(&self.state) }.into();
-            unsafe { let _ = session.RegisterAudioSessionNotification(&evts); }
-            // Must keep evts alive — WASAPI does not AddRef it.
-            self.state.session_events.lock().unwrap().push((session.clone(), evts));
+            register_session_events(&self.state, session);
         }
         recheck(&self.state);
         Ok(())
@@ -284,47 +410,65 @@ fn register_all(
     state: &Arc<SharedState>,
 ) -> Vec<(IAudioSessionManager2, IAudioSessionNotification)> {
     let mut keepers = Vec::new();
-    let Some(target_cid) = watch_cid else { return keepers; };
+    let Some(target_cid) = watch_cid else {
+        return keepers;
+    };
     unsafe {
         let Ok(enumerator) =
             CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        else { return keepers; };
+        else {
+            return keepers;
+        };
 
-        let Ok(collection) =
-            enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
-        else { return keepers; };
+        let Ok(collection) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+            return keepers;
+        };
         let collection: IMMDeviceCollection = collection;
 
-        let dev_count = match collection.GetCount() { Ok(n) => n, Err(_) => return keepers };
+        let dev_count = match collection.GetCount() {
+            Ok(n) => n,
+            Err(_) => return keepers,
+        };
 
         for i in 0..dev_count {
-            let device: IMMDevice = match collection.Item(i) { Ok(d) => d, Err(_) => continue };
+            let device: IMMDevice = match collection.Item(i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
 
             match get_container_id(&device) {
                 Some(cid) if cid == *target_cid => {}
                 _ => continue,
             }
 
-            let manager: IAudioSessionManager2 =
-                match device.Activate(CLSCTX_ALL, None) { Ok(m) => m, Err(_) => continue };
+            let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
 
-            let notif: IAudioSessionNotification =
-                SessionNotification { state: Arc::clone(state) }.into();
+            let notif: IAudioSessionNotification = SessionNotification {
+                state: Arc::clone(state),
+            }
+            .into();
             if manager.RegisterSessionNotification(&notif).is_ok() {
                 keepers.push((manager.clone(), notif));
             }
 
             // Register events on sessions that already exist.
-            let Ok(session_enum) = manager.GetSessionEnumerator() else { continue };
+            let Ok(session_enum) = manager.GetSessionEnumerator() else {
+                continue;
+            };
             let session_enum: IAudioSessionEnumerator = session_enum;
-            let session_count = match session_enum.GetCount() { Ok(c) => c, Err(_) => continue };
+            let session_count = match session_enum.GetCount() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             for j in 0..session_count {
-                let session: IAudioSessionControl =
-                    match session_enum.GetSession(j) { Ok(s) => s, Err(_) => continue };
-                let evts: IAudioSessionEvents =
-                    SessionEvents { state: Arc::downgrade(state) }.into();
-                let _ = session.RegisterAudioSessionNotification(&evts);
-                state.session_events.lock().unwrap().push((session, evts));
+                let session: IAudioSessionControl = match session_enum.GetSession(j) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                register_session_events(state, &session);
             }
         }
     }
@@ -353,7 +497,9 @@ pub fn session_monitor_loop(
     if verbose {
         match &watch_container_id {
             Some(cid) => eprintln!("[monitor] watching ContainerID {:?}", cid),
-            None => eprintln!("[monitor] no output device — monitor inactive (engine stays paused)"),
+            None => {
+                eprintln!("[monitor] no output device — monitor inactive (engine stays paused)")
+            }
         }
     }
 
@@ -382,10 +528,16 @@ pub fn session_monitor_loop(
     }
 
     for (manager, notif) in &_keepers {
-        unsafe { let _ = manager.UnregisterSessionNotification(notif); }
+        unsafe {
+            let _ = manager.UnregisterSessionNotification(notif);
+        }
     }
     let mut pairs = state.session_events.lock().unwrap();
-    for (session, evts) in pairs.drain(..) {
-        unsafe { let _ = session.UnregisterAudioSessionNotification(&evts); }
+    for entry in pairs.drain(..) {
+        unsafe {
+            let _ = entry
+                .session
+                .UnregisterAudioSessionNotification(&entry.evts);
+        }
     }
 }

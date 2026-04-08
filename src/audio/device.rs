@@ -1,23 +1,25 @@
 // WASAPI device enumeration and selection.
 
-use anyhow::{bail, Context, Result};
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use anyhow::{Context, Result, bail};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
-    eCapture, eRender, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
-    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
+    eCapture, eRender,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED, STGM,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::core::PWSTR;
 
 /// Initialises COM (must be called once per thread before any WASAPI work).
 pub fn com_init() -> Result<ComGuard> {
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED).ok().context("CoInitializeEx")
+        CoInitializeEx(None, COINIT_MULTITHREADED)
+            .ok()
+            .context("CoInitializeEx")
     }
     .map(|_| ComGuard)
 }
@@ -26,7 +28,9 @@ pub struct ComGuard;
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        unsafe { CoUninitialize(); }
+        unsafe {
+            CoUninitialize();
+        }
     }
 }
 
@@ -89,11 +93,12 @@ pub struct DeviceInfo {
     pub id: String,
 }
 
-fn enumerate_devices(data_flow: windows::Win32::Media::Audio::EDataFlow) -> Result<Vec<DeviceInfo>> {
+fn enumerate_devices(
+    data_flow: windows::Win32::Media::Audio::EDataFlow,
+) -> Result<Vec<DeviceInfo>> {
     let enumerator = get_enumerator()?;
-    let collection: IMMDeviceCollection = unsafe {
-        enumerator.EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)?
-    };
+    let collection: IMMDeviceCollection =
+        unsafe { enumerator.EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)? };
     let count = unsafe { collection.GetCount()? };
     let mut devices = Vec::with_capacity(count as usize);
     for i in 0..count {

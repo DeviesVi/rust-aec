@@ -40,18 +40,15 @@ impl AecProcessor {
     pub fn process_frame(&mut self, mic_frame: &[f32], ref_frame: &[f32], out: &mut [f32]) {
         // Feed far-end (speaker/reference) signal.
         self.render_buf.fill(0.0);
-        if let Err(e) = self.apm.process_render_f32(
-            &[ref_frame],
-            &mut [&mut self.render_buf],
-        ) {
+        if let Err(e) = self
+            .apm
+            .process_render_f32(&[ref_frame], &mut [&mut self.render_buf])
+        {
             eprintln!("[aec] process_render error: {e}");
         }
 
         // Process near-end (microphone) signal — echo cancellation applied here.
-        if let Err(e) = self.apm.process_capture_f32(
-            &[mic_frame],
-            &mut [out],
-        ) {
+        if let Err(e) = self.apm.process_capture_f32(&[mic_frame], &mut [out]) {
             eprintln!("[aec] process_capture error: {e}");
             // Passthrough mic audio on error.
             out.copy_from_slice(mic_frame);

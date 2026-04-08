@@ -1,5 +1,6 @@
 pub fn resize_zeroed(buf: &mut Vec<f32>, len: usize) {
     buf.resize(len, 0.0);
+    buf.fill(0.0);
 }
 
 pub unsafe fn convert_to_f32_mono_into(
@@ -13,14 +14,16 @@ pub unsafe fn convert_to_f32_mono_into(
 
     match bits {
         32 => {
-            let data = unsafe { std::slice::from_raw_parts(buffer as *const f32, frames * channels) };
+            let data =
+                unsafe { std::slice::from_raw_parts(buffer as *const f32, frames * channels) };
             for (i, frame) in data.chunks(channels).enumerate() {
                 let sum: f32 = frame.iter().sum();
                 out[i] = sum / channels as f32;
             }
         }
         16 => {
-            let data = unsafe { std::slice::from_raw_parts(buffer as *const i16, frames * channels) };
+            let data =
+                unsafe { std::slice::from_raw_parts(buffer as *const i16, frames * channels) };
             for (i, frame) in data.chunks(channels).enumerate() {
                 let sum: f32 = frame.iter().map(|&s| s as f32 / 32768.0).sum();
                 out[i] = sum / channels as f32;
