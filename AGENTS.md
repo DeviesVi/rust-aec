@@ -10,15 +10,13 @@ Real-time Acoustic Echo Cancellation (AEC) for Windows. Captures microphone + sp
 Main thread:       Win32 message pump + system tray icon (src/tray.rs)
 Session monitor:   WASAPI session callbacks → Resume/Pause commands (src/audio/session_monitor.rs)
 Engine thread:     AEC processing loop (src/engine.rs)
-  WarmPipeline (always running):
-    loopback:      WASAPI loopback → ref_ring (src/audio/loopback.rs)
-    render:        out_ring → Virtual Cable (src/audio/render.rs)
-  MicCapture (on-demand only):
-    mic-capture:   WASAPI capture → mic_ring (src/audio/capture.rs)
+  loopback-capture:  WASAPI loopback → ref_ring (src/audio/loopback.rs)   ┐
+  render:            out_ring → Virtual Cable (src/audio/render.rs)        ├─ all started on Resume
+  mic-capture:       WASAPI capture → mic_ring (src/audio/capture.rs)     ┘    stopped on Pause
 ```
 
 - **Main thread**: Runs Win32 message pump for the system tray icon. Sends `EngineCommand` to the engine thread via `crossbeam-channel`.
-- **Engine thread**: Owns the AEC processor + audio threads + ring buffers. On startup, the `WarmPipeline` (loopback + render) is started immediately; `MicCapture` (real mic) is only started when the session monitor sends `EngineCommand::Resume`. When `MicCapture` is not running the engine drains ref_ring and writes silence to out_ring to keep the render thread fed.
+- **Engine thread**: Owns the AEC processor + audio threads + ring buffers. All three threads (loopback-capture, render, mic-capture) are started together on `EngineCommand::Resume` and stopped on `EngineCommand::Pause`. Resume latency is ~50–100 ms (concurrent WASAPI init). When the ref pipeline is up but mic is not yet started (edge case between RefPipeline start and MicCapture start), the engine drains ref_ring and writes silence to out_ring to keep the render thread fed.
 - **Session monitor thread**: Registers `IAudioSessionNotification` on all capture devices (except the real mic) to receive instant callbacks when programs start/stop recording from CABLE Output. Each callback re-queries the OS for the live active session count; own-process sessions (rust-aec's MicCapture) are excluded by PID. Sends `Resume`/`Pause` to the engine only when state changes. The real mic is therefore only open while at least one external program is recording.
 - **Inter-thread comms**: Lock-free SPSC ring buffers (`ringbuf` crate), 200ms capacity. Commands via `crossbeam-channel`.
 - **Processing**: 10ms frames (480 samples @ 48kHz). AEC via `sonora` (pure-Rust WebRTC AEC3 port).
@@ -29,7 +27,7 @@ Engine thread:     AEC processing loop (src/engine.rs)
 | File | Purpose |
 |---|---|
 | `src/main.rs` | CLI parsing, device selection (with cable filtering), tray + engine startup |
-| `src/engine.rs` | `AudioEngine` — AEC processing loop, `WarmPipeline`/`MicCapture` lifecycle, `EngineCommand` handling |
+| `src/engine.rs` | `AudioEngine` — AEC processing loop, `RefPipeline`/`MicCapture` lifecycle, `EngineCommand` handling |
 | `src/audio/session_monitor.rs` | COM callback session monitor — detects recording sessions via `IAudioSessionNotification`/`IAudioSessionEvents`, sends `Resume`/`Pause` to engine |
 | `src/tray.rs` | Win32 system tray icon, context menus, `TrayState` shared with engine |
 | `src/autostart.rs` | Registry-based Windows autostart (`HKCU\...\Run`) |
@@ -65,7 +63,7 @@ Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free). It creates
 - **Cable filtering**: When auto-selecting a microphone, devices with "cable" in the name are skipped to avoid selecting a virtual cable as input.
 - **Device hot-swap**: When the user changes a device via the tray menu, the entire audio pipeline is torn down and rebuilt. The AEC re-adapts in ~1-2 seconds.
 - **Shared state**: `TrayState` (device lists + current selections) is protected by `Arc<Mutex<>>`, accessed by both the tray (for menu building) and the engine (for device IDs).
-- **On-demand mic**: `WarmPipeline` (loopback + render) runs from startup so the cable output is always primed. `MicCapture` is started only when the session monitor detects an external program recording from CABLE Output, and stopped when all such sessions end. This keeps the microphone-in-use indicator off while idle.
+- **On-demand pipeline**: All three audio threads are started only when the session monitor detects an external program recording from CABLE Output, and stopped when all such sessions end. This keeps all device handles (including the microphone-in-use indicator) released while idle.
 - **WASAPI session event lifetime**: `IAudioSessionManager2::RegisterSessionNotification` and `IAudioSessionControl::RegisterAudioSessionNotification` do **not** `AddRef` the callback objects. The caller must hold strong references for the entire monitoring period. In `session_monitor.rs`, `IAudioSessionNotification` objects are stored in `_keepers` and `IAudioSessionEvents` objects in `SharedState::session_events`; dropping either silently kills all callbacks.
 - **Counter-free session detection**: Rather than maintaining a local active-session count (which can drift on missed events or late startup), each callback calls `count_active_sessions()` to query the OS directly. Sessions owned by the current process (PID match via `IAudioSessionControl2::GetProcessId`) are excluded so MicCapture's own session cannot prevent a self-Pause.
 
