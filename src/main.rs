@@ -280,6 +280,7 @@ fn run(verbose: bool) -> Result<()> {
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let monitor_stop_clone = monitor_stop.clone();
     let monitor_cmd_tx = cmd_tx.clone();
+    let monitor_state = state.clone();
     let monitor_output_id = {
         let st = state.lock().unwrap();
         st.current_output_id.clone()
@@ -290,6 +291,7 @@ fn run(verbose: bool) -> Result<()> {
             crate::audio::session_monitor::session_monitor_loop(
                 monitor_output_id,
                 monitor_cmd_tx,
+                monitor_state,
                 monitor_stop_clone,
                 verbose,
             );

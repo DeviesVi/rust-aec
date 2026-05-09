@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_ContainerId;
@@ -40,6 +40,7 @@ use windows::core::{GUID, implement};
 use windows_core::Interface;
 
 use crate::engine::EngineCommand;
+use crate::tray::TrayState;
 
 const VT_CLSID: u16 = 72;
 
@@ -51,7 +52,7 @@ struct SharedState {
     /// ContainerID of the output render device (e.g. CABLE Input).
     /// Only capture endpoints with this ContainerID are watched.
     /// None = no output device; monitor registers nothing and stays paused.
-    watch_container_id: Option<GUID>,
+    watch_container_id: Mutex<Option<GUID>>,
     cmd_tx: Sender<EngineCommand>,
     /// true = we last sent Resume; false = we last sent Pause (or haven't sent yet).
     engine_running: AtomicBool,
@@ -114,7 +115,8 @@ fn recheck(state: &SharedState) {
     // COM may not be initialized on the callback thread — initialize lazily.
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
 
-    let active = count_active_sessions(state.watch_container_id.as_ref());
+    let watch_cid = *state.watch_container_id.lock().unwrap();
+    let active = count_active_sessions(watch_cid.as_ref());
 
     if com_initialized {
         unsafe {
@@ -475,6 +477,57 @@ fn register_all(
     keepers
 }
 
+fn unregister_all(
+    keepers: &mut Vec<(IAudioSessionManager2, IAudioSessionNotification)>,
+    state: &Arc<SharedState>,
+) {
+    for (manager, notif) in keepers.drain(..) {
+        unsafe {
+            let _ = manager.UnregisterSessionNotification(&notif);
+        }
+    }
+
+    let mut events = state.session_events.lock().unwrap();
+    for entry in events.drain(..) {
+        unsafe {
+            let _ = entry
+                .session
+                .UnregisterAudioSessionNotification(&entry.evts);
+        }
+    }
+}
+
+fn rebind_monitor(
+    state: &Arc<SharedState>,
+    keepers: &mut Vec<(IAudioSessionManager2, IAudioSessionNotification)>,
+    current_output_id: &mut Option<String>,
+    new_output_id: Option<String>,
+) {
+    if *current_output_id == new_output_id {
+        return;
+    }
+
+    unregister_all(keepers, state);
+    let watch_container_id = new_output_id.as_deref().and_then(resolve_watch_container);
+    {
+        let mut watch = state.watch_container_id.lock().unwrap();
+        *watch = watch_container_id;
+    }
+    state.needs_prune.store(false, Ordering::Release);
+    *keepers = register_all(watch_container_id.as_ref(), state);
+    *current_output_id = new_output_id;
+
+    if state.verbose {
+        match watch_container_id {
+            Some(cid) => eprintln!("[monitor] rebound to ContainerID {:?}", cid),
+            None => eprintln!("[monitor] no output device after rebind"),
+        }
+        eprintln!("[monitor] registered on {} device(s)", keepers.len());
+    }
+
+    recheck(state);
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point.
 // ---------------------------------------------------------------------------
@@ -485,12 +538,14 @@ fn register_all(
 pub fn session_monitor_loop(
     output_render_id: Option<String>,
     cmd_tx: Sender<EngineCommand>,
+    tray_state: Arc<Mutex<TrayState>>,
     stop: Arc<AtomicBool>,
     verbose: bool,
 ) {
     let _com = crate::audio::device::com_init().expect("COM init failed in session-monitor thread");
 
-    let watch_container_id = output_render_id
+    let mut current_output_id = output_render_id;
+    let watch_container_id = current_output_id
         .as_deref()
         .and_then(resolve_watch_container);
 
@@ -504,7 +559,7 @@ pub fn session_monitor_loop(
     }
 
     let state = Arc::new(SharedState {
-        watch_container_id,
+        watch_container_id: Mutex::new(watch_container_id),
         cmd_tx,
         engine_running: AtomicBool::new(false),
         verbose,
@@ -512,32 +567,32 @@ pub fn session_monitor_loop(
         needs_prune: AtomicBool::new(false),
     });
 
-    let _keepers = register_all(state.watch_container_id.as_ref(), &state);
+    let mut keepers = register_all(watch_container_id.as_ref(), &state);
 
     if verbose {
-        eprintln!("[monitor] registered on {} device(s)", _keepers.len());
+        eprintln!("[monitor] registered on {} device(s)", keepers.len());
     }
 
     recheck(&state);
+    let mut last_recheck = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(200));
+        let latest_output_id = tray_state.lock().unwrap().current_output_id.clone();
+        rebind_monitor(
+            &state,
+            &mut keepers,
+            &mut current_output_id,
+            latest_output_id,
+        );
         if state.needs_prune.swap(false, Ordering::AcqRel) {
             prune_expired_sessions(&state);
         }
+        if last_recheck.elapsed() >= Duration::from_secs(2) {
+            recheck(&state);
+            last_recheck = Instant::now();
+        }
     }
 
-    for (manager, notif) in &_keepers {
-        unsafe {
-            let _ = manager.UnregisterSessionNotification(notif);
-        }
-    }
-    let mut pairs = state.session_events.lock().unwrap();
-    for entry in pairs.drain(..) {
-        unsafe {
-            let _ = entry
-                .session
-                .UnregisterAudioSessionNotification(&entry.evts);
-        }
-    }
+    unregister_all(&mut keepers, &state);
 }
