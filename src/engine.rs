@@ -170,22 +170,26 @@ impl MicCapture {
 impl AudioEngine {
     fn auto_mic_id(capture: &[device::DeviceInfo]) -> Option<String> {
         match device::default_capture_device_id() {
-            Ok(default_id) => {
-                let name = device::device_name_by_id(&capture, &default_id);
-                if device::is_virtual_cable(&name) {
-                    device::find_real_capture_device(&capture).ok()
-                } else {
-                    Some(default_id)
-                }
-            }
+            Ok(default_id) => capture
+                .iter()
+                .find(|d| d.id == default_id)
+                .and_then(|d| (!device::is_auto_mic_excluded(&d.name)).then(|| default_id.clone()))
+                .or_else(|| device::find_real_capture_device(capture).ok()),
             Err(_) => device::find_real_capture_device(&capture).ok(),
         }
     }
 
     fn auto_speaker_id(render: &[device::DeviceInfo]) -> Option<String> {
-        device::default_render_device_id()
-            .ok()
-            .filter(|id| render.iter().any(|d| d.id == *id))
+        match device::default_render_device_id() {
+            Ok(default_id) => render
+                .iter()
+                .find(|d| d.id == default_id)
+                .and_then(|d| {
+                    (!device::is_auto_speaker_excluded(&d.name)).then(|| default_id.clone())
+                })
+                .or_else(|| device::find_real_render_device(render).ok()),
+            Err(_) => device::find_real_render_device(render).ok(),
+        }
     }
 
     fn auto_output_id(render: &[device::DeviceInfo]) -> Option<String> {
@@ -201,33 +205,57 @@ impl AudioEngine {
         let capture_result = device::list_capture_devices();
         let render_result = device::list_render_devices();
 
-        let (capture, render) = {
+        let (capture, render, preferred_mic, preferred_speaker, preferred_output) = {
             let st = self.state.lock().unwrap();
             (
                 capture_result.unwrap_or_else(|_| st.capture_devices.clone()),
                 render_result.unwrap_or_else(|_| st.render_devices.clone()),
+                st.preferred_mic_id.clone(),
+                st.preferred_speaker_id.clone(),
+                st.preferred_output_id.clone(),
             )
         };
 
-        let mic_id = match current_mic {
+        let mic_id = match preferred_mic.as_deref() {
             Some(id) if capture.iter().any(|d| d.id == id) => Some(id.to_string()),
-            _ => Self::auto_mic_id(&capture),
+            Some(_) => None,
+            None => current_mic
+                .filter(|id| capture.iter().any(|d| d.id == *id))
+                .map(str::to_string)
+                .or_else(|| Self::auto_mic_id(&capture)),
         };
-        let speaker_id = match current_speaker {
+        let speaker_id = match preferred_speaker.as_deref() {
             Some(id) if render.iter().any(|d| d.id == id) => Some(id.to_string()),
-            _ => Self::auto_speaker_id(&render),
+            Some(_) => None,
+            None => current_speaker
+                .filter(|id| render.iter().any(|d| d.id == *id))
+                .map(str::to_string)
+                .or_else(|| Self::auto_speaker_id(&render)),
         };
-        let output_id = match current_output {
+        let output_id = match preferred_output.as_deref() {
             Some(id) if render.iter().any(|d| d.id == id) => Some(id.to_string()),
-            _ => Self::auto_output_id(&render),
+            Some(_) => None,
+            None => current_output
+                .filter(|id| render.iter().any(|d| d.id == *id))
+                .map(str::to_string)
+                .or_else(|| Self::auto_output_id(&render)),
         };
 
         let mut st = self.state.lock().unwrap();
         st.capture_devices = capture;
         st.render_devices = render;
         st.current_mic_id = mic_id.clone();
+        if st.preferred_mic_id.is_none() {
+            st.preferred_mic_id = mic_id.clone();
+        }
         st.current_speaker_id = speaker_id.clone();
+        if st.preferred_speaker_id.is_none() {
+            st.preferred_speaker_id = speaker_id.clone();
+        }
         st.current_output_id = output_id.clone();
+        if st.preferred_output_id.is_none() {
+            st.preferred_output_id = output_id.clone();
+        }
 
         (mic_id, speaker_id, output_id)
     }
@@ -475,7 +503,11 @@ impl AudioEngine {
                     mic_capture = None;
                     processor = None;
                     mic_id = Some(new_id.clone());
-                    self.state.lock().unwrap().current_mic_id = Some(new_id);
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.preferred_mic_id = Some(new_id.clone());
+                        st.current_mic_id = Some(new_id);
+                    }
                     self.ensure_running(
                         &mut mic_id,
                         &mut speaker_id,
@@ -499,7 +531,11 @@ impl AudioEngine {
                     }
                     ref_pipe = None;
                     speaker_id = Some(new_id.clone());
-                    self.state.lock().unwrap().current_speaker_id = Some(new_id);
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.preferred_speaker_id = Some(new_id.clone());
+                        st.current_speaker_id = Some(new_id);
+                    }
                     self.start_ref_pipeline(
                         &speaker_id,
                         &output_id,
@@ -530,7 +566,11 @@ impl AudioEngine {
                     }
                     ref_pipe = None;
                     output_id = Some(new_id.clone());
-                    self.state.lock().unwrap().current_output_id = Some(new_id);
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.preferred_output_id = Some(new_id.clone());
+                        st.current_output_id = Some(new_id);
+                    }
                     self.start_ref_pipeline(
                         &speaker_id,
                         &output_id,

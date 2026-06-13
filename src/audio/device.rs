@@ -183,6 +183,31 @@ pub fn is_virtual_cable(name: &str) -> bool {
     lower.contains("cable")
 }
 
+/// Returns true if the capture endpoint is usually a virtual/redirected input.
+///
+/// These endpoints are valid devices, but they are bad automatic microphone
+/// fallbacks because they often appear during RDP/Steam/streaming sessions.
+pub fn is_auto_mic_excluded(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    is_virtual_cable(name)
+        || lower.contains("steam")
+        || lower.contains("remote")
+        || lower.contains("rdp")
+        || lower.contains("redirected")
+        || lower.contains("virtual")
+        || lower.contains("stream")
+}
+
+/// Returns true if a render endpoint is usually a bad automatic loopback source.
+pub fn is_auto_speaker_excluded(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    is_virtual_cable(name)
+        || lower.contains("remote")
+        || lower.contains("rdp")
+        || lower.contains("redirected")
+        || lower.contains("virtual")
+}
+
 /// Find a device by substring of its friendly name (case-insensitive). Returns its ID.
 pub fn find_device_id_by_name(devices: &[DeviceInfo], query: &str) -> Result<String> {
     let query_lower = query.to_lowercase();
@@ -194,14 +219,24 @@ pub fn find_device_id_by_name(devices: &[DeviceInfo], query: &str) -> Result<Str
     bail!("No device matching '{query}' found")
 }
 
-/// Find the first real (non-virtual-cable) capture device. Returns its ID.
+/// Find the first capture device that is suitable for automatic mic selection.
 pub fn find_real_capture_device(devices: &[DeviceInfo]) -> Result<String> {
     for info in devices {
-        if !is_virtual_cable(&info.name) {
+        if !is_auto_mic_excluded(&info.name) {
             return Ok(info.id.clone());
         }
     }
-    bail!("No real microphone found (all capture devices appear to be virtual cables)")
+    bail!("No real microphone found (all capture devices appear to be virtual/redirected)")
+}
+
+/// Find the first render device that is suitable for automatic speaker loopback.
+pub fn find_real_render_device(devices: &[DeviceInfo]) -> Result<String> {
+    for info in devices {
+        if !is_auto_speaker_excluded(&info.name) {
+            return Ok(info.id.clone());
+        }
+    }
+    bail!("No real speaker found (all render devices appear to be virtual/redirected)")
 }
 
 /// Get the device name for a given device ID, or "Unknown" if not found.

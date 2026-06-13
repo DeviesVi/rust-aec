@@ -37,8 +37,11 @@ const ID_EXIT: u32 = 9999;
 pub struct TrayState {
     pub capture_devices: Vec<DeviceInfo>,
     pub render_devices: Vec<DeviceInfo>,
+    pub preferred_mic_id: Option<String>,
     pub current_mic_id: Option<String>,
+    pub preferred_speaker_id: Option<String>,
     pub current_speaker_id: Option<String>,
+    pub preferred_output_id: Option<String>,
     pub current_output_id: Option<String>,
 }
 
@@ -210,7 +213,7 @@ unsafe fn handle_right_click(hwnd: HWND) {
                 cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
                 fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE,
                 fType: MFT_RADIOCHECK,
-                fState: if Some(&dev.id) == st.current_mic_id.as_ref() {
+                fState: if Some(&dev.id) == st.preferred_mic_id.as_ref() {
                     MFS_CHECKED
                 } else {
                     MFS_UNCHECKED
@@ -255,7 +258,7 @@ unsafe fn handle_right_click(hwnd: HWND) {
                 cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
                 fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE,
                 fType: MFT_RADIOCHECK,
-                fState: if Some(&dev.id) == st.current_speaker_id.as_ref() {
+                fState: if Some(&dev.id) == st.preferred_speaker_id.as_ref() {
                     MFS_CHECKED
                 } else {
                     MFS_UNCHECKED
@@ -300,7 +303,7 @@ unsafe fn handle_right_click(hwnd: HWND) {
                 cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
                 fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE | MIIM_STATE,
                 fType: MFT_RADIOCHECK,
-                fState: if Some(&dev.id) == st.current_output_id.as_ref() {
+                fState: if Some(&dev.id) == st.preferred_output_id.as_ref() {
                     MFS_CHECKED
                 } else {
                     MFS_UNCHECKED
@@ -445,8 +448,8 @@ unsafe fn handle_menu_command(id: u32) {
                 let new_id = dev.id.clone();
                 config::save(
                     Some(&new_id),
-                    st.current_speaker_id.as_deref(),
-                    st.current_output_id.as_deref(),
+                    st.preferred_speaker_id.as_deref(),
+                    st.preferred_output_id.as_deref(),
                 );
                 drop(st);
                 let _ = ctx.cmd_tx.send(EngineCommand::SetMicDevice(new_id));
@@ -457,9 +460,9 @@ unsafe fn handle_menu_command(id: u32) {
             if let Some(dev) = st.render_devices.get(idx) {
                 let new_id = dev.id.clone();
                 config::save(
-                    st.current_mic_id.as_deref(),
+                    st.preferred_mic_id.as_deref(),
                     Some(&new_id),
-                    st.current_output_id.as_deref(),
+                    st.preferred_output_id.as_deref(),
                 );
                 drop(st);
                 let _ = ctx.cmd_tx.send(EngineCommand::SetSpeakerDevice(new_id));
@@ -470,8 +473,8 @@ unsafe fn handle_menu_command(id: u32) {
             if let Some(dev) = st.render_devices.get(idx) {
                 let new_id = dev.id.clone();
                 config::save(
-                    st.current_mic_id.as_deref(),
-                    st.current_speaker_id.as_deref(),
+                    st.preferred_mic_id.as_deref(),
+                    st.preferred_speaker_id.as_deref(),
                     Some(&new_id),
                 );
                 drop(st);

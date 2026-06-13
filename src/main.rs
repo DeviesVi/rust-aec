@@ -119,39 +119,35 @@ fn run(verbose: bool) -> Result<()> {
 
     // Select mic: CLI arg > saved config ID > default (if not a cable) > first real mic.
     // Returns None when no mic is available (e.g. Remote Desktop with no audio).
-    let mic_id: Option<String> = if let Some(q) = mic_query {
+    let cfg_mic = cfg.mic;
+    let preferred_mic_id: Option<String> = if let Some(q) = mic_query {
         Some(device::find_device_id_by_name(&capture_devices, q).context("Mic device not found")?)
-    } else if let Some(id) = cfg.mic {
-        if capture_devices.iter().any(|d| d.id == id) {
+    } else {
+        cfg_mic.clone()
+    };
+    let mic_id: Option<String> = if let Some(id) = preferred_mic_id.as_ref() {
+        if capture_devices.iter().any(|d| d.id == *id) {
             if verbose {
                 println!(
                     "Mic: loaded from config ({})",
-                    device::device_name_by_id(&capture_devices, &id)
+                    device::device_name_by_id(&capture_devices, id)
                 );
             }
-            Some(id)
+            Some(id.clone())
         } else {
-            // Saved device no longer present — fall through to auto-detect.
-            match device::default_capture_device_id() {
-                Ok(default_id) => {
-                    let default_name = device::device_name_by_id(&capture_devices, &default_id);
-                    if device::is_virtual_cable(&default_name) {
-                        device::find_real_capture_device(&capture_devices).ok()
-                    } else {
-                        Some(default_id)
-                    }
-                }
-                Err(_) => None,
+            if verbose {
+                println!("Preferred mic is not present, waiting for it to return.");
             }
+            None
         }
     } else {
         match device::default_capture_device_id() {
             Ok(default_id) => {
                 let default_name = device::device_name_by_id(&capture_devices, &default_id);
-                if device::is_virtual_cable(&default_name) {
+                if device::is_auto_mic_excluded(&default_name) {
                     if verbose {
                         println!(
-                            "Default capture device '{}' is a virtual cable, looking for a real mic...",
+                            "Default capture device '{}' is virtual/redirected, looking for a real mic...",
                             default_name
                         );
                     }
@@ -169,27 +165,50 @@ fn run(verbose: bool) -> Result<()> {
         }
     };
 
-    // Select speaker for loopback: CLI arg > saved config ID > default render device.
-    let speaker_id: Option<String> = if let Some(q) = speaker_query {
+    // Select speaker for loopback: CLI arg > saved config ID > default real render device.
+    let cfg_speaker = cfg.speaker;
+    let preferred_speaker_id: Option<String> = if let Some(q) = speaker_query {
         Some(
             device::find_device_id_by_name(&render_devices, q)
                 .context("Speaker device not found")?,
         )
-    } else if let Some(id) = cfg.speaker {
-        if render_devices.iter().any(|d| d.id == id) {
+    } else {
+        cfg_speaker.clone()
+    };
+    let speaker_id: Option<String> = if let Some(id) = preferred_speaker_id.as_ref() {
+        if render_devices.iter().any(|d| d.id == *id) {
             if verbose {
                 println!(
                     "Speaker: loaded from config ({})",
-                    device::device_name_by_id(&render_devices, &id)
+                    device::device_name_by_id(&render_devices, id)
                 );
             }
-            Some(id)
+            Some(id.clone())
         } else {
-            device::default_render_device_id().ok()
+            if verbose {
+                println!("Preferred speaker is not present, waiting for it to return.");
+            }
+            None
         }
     } else {
         match device::default_render_device_id() {
-            Ok(id) => Some(id),
+            Ok(default_id) => render_devices
+                .iter()
+                .find(|d| d.id == default_id)
+                .and_then(|d| {
+                    if device::is_auto_speaker_excluded(&d.name) {
+                        if verbose {
+                            println!(
+                                "Default render device '{}' is virtual/redirected, looking for a real speaker...",
+                                d.name
+                            );
+                        }
+                        None
+                    } else {
+                        Some(default_id)
+                    }
+                })
+                .or_else(|| device::find_real_render_device(&render_devices).ok()),
             Err(_) => {
                 if verbose {
                     println!("No render device found, starting without speaker.");
@@ -200,22 +219,29 @@ fn run(verbose: bool) -> Result<()> {
     };
 
     // Select output virtual cable: CLI arg > saved config ID > device with "cable input" in name.
-    let output_id: Option<String> = if let Some(q) = output_query {
+    let cfg_output = cfg.output;
+    let preferred_output_id: Option<String> = if let Some(q) = output_query {
         Some(
             device::find_device_id_by_name(&render_devices, q)
                 .context("Output virtual cable device not found")?,
         )
-    } else if let Some(id) = cfg.output {
-        if render_devices.iter().any(|d| d.id == id) {
+    } else {
+        cfg_output.clone()
+    };
+    let output_id: Option<String> = if let Some(id) = preferred_output_id.as_ref() {
+        if render_devices.iter().any(|d| d.id == *id) {
             if verbose {
                 println!(
                     "Output: loaded from config ({})",
-                    device::device_name_by_id(&render_devices, &id)
+                    device::device_name_by_id(&render_devices, id)
                 );
             }
-            Some(id)
+            Some(id.clone())
         } else {
-            device::find_device_id_by_name(&render_devices, "cable input").ok()
+            if verbose {
+                println!("Preferred output is not present, waiting for it to return.");
+            }
+            None
         }
     } else {
         match device::find_device_id_by_name(&render_devices, "cable input") {
@@ -251,8 +277,11 @@ fn run(verbose: bool) -> Result<()> {
     let state = Arc::new(Mutex::new(TrayState {
         capture_devices,
         render_devices,
+        preferred_mic_id: preferred_mic_id.or_else(|| mic_id.clone()),
         current_mic_id: mic_id,
+        preferred_speaker_id: preferred_speaker_id.or_else(|| speaker_id.clone()),
         current_speaker_id: speaker_id,
+        preferred_output_id: preferred_output_id.or_else(|| output_id.clone()),
         current_output_id: output_id,
     }));
 
